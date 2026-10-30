@@ -31,6 +31,8 @@ const LORIAN_TOOL_URL: &str = "https://tools.voxisle.art/";
 const LORIAN_TOOL_LOGO: &[u8] = include_bytes!("../logos/logo-square-LorianTool.png");
 const APP_LOGO: &[u8] = include_bytes!("../logos/bindlink-256.png");
 const APP_NAME: &str = "BindLink 键链";
+/// 取自 Cargo.toml，版本号只需在那里维护。
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEADER_ICON_SIZE: f32 = 18.0;
 const HEADER_LOGO_SIZE: f32 = 28.0;
 
@@ -433,6 +435,7 @@ impl MigratorApp {
                 );
             }
             ui.label(RichText::new(APP_NAME).size(20.0).strong());
+            ui.label(RichText::new(format!("v{APP_VERSION}")).small().weak());
             ui.label(RichText::new("把按键、配置、地图与缓存迁移到新实例").weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 egui::widgets::global_theme_preference_buttons(ui);
