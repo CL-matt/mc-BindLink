@@ -3,6 +3,10 @@ name = "mc-bindsync"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "bindlink"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 eframe = "0.37.0"

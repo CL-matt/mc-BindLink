@@ -23,7 +23,7 @@ BindLink（键链）是一个 Windows 桌面工具，把一个 Minecraft 实例�
 
 1. 关闭所有正在运行的 Minecraft。游戏运行时会占用 Voxy 与 Bobby 缓存文件，工具检测到占用时会跳过对应缓存，材质包同理；游戏也可能在退出时覆盖刚迁移的 `options.txt`。
 2. 目标实例至少要启动过一次游戏，生成自己的 `options.txt`。目标没有 `options.txt` 时，工具会跳过选项同步并在日志中提示。
-3. 把 `mc-bindsync.exe` 放到 PCL 程序所在的文件夹（与 `.minecraft` 同级），启动时会自动发现其中的实例。放在其他位置也可以，启动后用"添加目录…"选择 `.minecraft`、它的上级目录或某个版本目录。
+3. 把 `bindlink.exe` 放到 PCL 程序所在的文件夹（与 `.minecraft` 同级），启动时会自动发现其中的实例。放在其他位置也可以，启动后用"添加目录…"选择 `.minecraft`、它的上级目录或某个版本目录。
 
 ### 迁移步骤
 
@@ -83,7 +83,7 @@ BindLink（键链）是一个 Windows 桌面工具，把一个 Minecraft 实例�
 cargo build --release
 ```
 
-`.cargo/config.toml` 把构建产物目录设在 `<构建目录>`，其他机器上构建前请修改或删除该配置。运行 `cargo test` 执行单元测试。
+`.cargo/config.toml` 把构建产物目录设在 `<构建目录>`，其他机器上构建前请修改或删除该配置。构建产物为 `target/release/bindlink.exe`。运行 `cargo test` 执行单元测试。
 
 ## 项目结构
 
