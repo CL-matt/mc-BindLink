@@ -53,6 +53,13 @@
 ### 2.4 独立 Mod 适配策略
 - **Axiom (JSON)**：文件路径 `config/axiom.json`。合并模式下提取 `keybinds` 字段进行局部替换。
 
+### 2.5 独立地图与缓存同步器 (`map_sync.rs`)
+- **常规地图与路点 (Xaero / JourneyMap)**：
+  - 目录：`XaeroWaypoints`, `XaeroWorldMap`, `journeymap`。
+  - 策略：以单人世界名或服务器 IP 维度进行文件夹级无损递归同步。
+- **Voxy 超远视距缓存**：
+  - 目录：`.minecraft/voxy` 或 `.voxy_cache`（体积通常达数百 MB 至数 GB）。
+  - 策略：**默认优先创建跨目录符号链接 (Symlink/Junction)**，实现多整合包共享缓存且 0 磁盘增量；同时提供可选的物理全量拷贝模式。
 
 ---
 
@@ -68,6 +75,7 @@
 - `src/main.rs`: 界面逻辑、状态存储、事件处理与日志流展示。
 - `src/engine.rs`: 核心业务逻辑（`options.txt` 解析、Mod 检测、配置读写与备份）。
 - `src/launcher.rs`: 启动器路径嗅探、隔离版本扫描。
+- `src/map_sync.rs`: 地图路点目录递归同步与 Voxy 缓存链接或拷贝。
 - `src/types.rs`: 全局公用枚举与数据结构定义。
 
 ### 核心数据结构
