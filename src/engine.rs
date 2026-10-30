@@ -120,6 +120,19 @@ pub fn run_migration(
         let outcome = sync_axiom_blueprints(request, method, resolve, log, &mut result);
         record_step_failure("Axiom 蓝图同步", outcome, log, &mut result);
     }
+    if let Some(method) = &request.screenshots {
+        let outcome = pack_sync::sync_shared_assets(
+            SharedAsset::Screenshots,
+            &request.template,
+            &request.target,
+            method,
+            None,
+            resolve,
+            log,
+        )
+        .map(|step| merge_result(&mut result, step.result));
+        record_step_failure("截图同步", outcome, log, &mut result);
+    }
 
     log.info(format!(
         "迁移结束：修改 {} 处，警告 {} 条",

@@ -37,6 +37,7 @@ pub fn asset_dir(kind: SharedAsset) -> &'static str {
     match kind {
         SharedAsset::ResourcePacks => "resourcepacks",
         SharedAsset::AxiomBlueprints => "config/axiom/blueprints",
+        SharedAsset::Screenshots => "screenshots",
     }
 }
 
@@ -44,13 +45,16 @@ fn shared_subdir(kind: SharedAsset) -> &'static str {
     match kind {
         SharedAsset::ResourcePacks => "resourcepacks",
         SharedAsset::AxiomBlueprints => "axiom-blueprints",
+        SharedAsset::Screenshots => "screenshots",
     }
 }
 
-/// 材质包目录中的每个文件或文件夹都是一个材质包；蓝图目录只处理 `.bp` 文件，排序文件由调用方单独合并。
+/// 材质包目录中的每个文件或文件夹都是一个材质包；蓝图目录只处理 `.bp` 文件，排序文件由调用方单独合并；
+/// 截图目录只处理文件。
 fn is_asset_entry(kind: SharedAsset, path: &Path) -> bool {
     match kind {
         SharedAsset::ResourcePacks => true,
+        SharedAsset::Screenshots => path.is_file(),
         SharedAsset::AxiomBlueprints => {
             path.is_file()
                 && path
@@ -393,7 +397,7 @@ fn describe_entry(kind: SharedAsset, path: &Path, owner: &str) -> Result<PackVer
     };
     // 版本号只用于帮助用户比较，读取失败时显示为未知
     let data_version = match kind {
-        SharedAsset::ResourcePacks => None,
+        SharedAsset::ResourcePacks | SharedAsset::Screenshots => None,
         SharedAsset::AxiomBlueprints => read_blueprint_data_version(path).ok(),
     };
     Ok(PackVersion {
@@ -760,6 +764,36 @@ mod tests {
 
         fs::write(b.path().join("assets/x.png"), "two")?;
         assert!(!have_same_content(a.path(), b.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn screenshots_link_to_shared_keeps_files_visible_from_both_instances() -> Result<()> {
+        let kind = SharedAsset::Screenshots;
+        let template_dir = TempDir::new("shots-template")?;
+        let target_dir = TempDir::new("shots-target")?;
+        let shared_root = TempDir::new("shots-store")?;
+        write_asset(kind, template_dir.path(), "2026-09-03_00.52.14.png", b"old")?;
+        write_asset(kind, target_dir.path(), "2026-10-30_21.00.00.png", b"new")?;
+
+        let mut seen = Vec::new();
+        sync_shared_assets(
+            kind,
+            &instance(&template_dir, "旧包"),
+            &instance(&target_dir, "新包"),
+            &PackTransfer::LinkToShared(shared_root.path().to_path_buf()),
+            None,
+            &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
+            &mut LogSink::new(&mut |_| {}),
+        )?;
+
+        assert!(seen.is_empty());
+        for game_dir in [template_dir.path(), target_dir.path()] {
+            let shots = game_dir.join(asset_dir(kind));
+            assert!(is_link(&shots)?);
+            assert!(shots.join("2026-09-03_00.52.14.png").is_file());
+            assert!(shots.join("2026-10-30_21.00.00.png").is_file());
+        }
         Ok(())
     }
 

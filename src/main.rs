@@ -107,6 +107,10 @@ impl PackChoice {
             (PackChoice::LinkToShared, SharedAsset::ResourcePacks) => {
                 "Junction 指向共享目录（同步启用列表）"
             }
+            (PackChoice::CopyMissing, SharedAsset::Screenshots) => "复制缺少的截图",
+            (PackChoice::LinkToShared, SharedAsset::Screenshots) => {
+                "Junction 指向共享目录（游戏内删除截图会影响所有实例）"
+            }
             (PackChoice::LinkToShared, SharedAsset::AxiomBlueprints) => {
                 "Junction 指向共享目录（仅限两个实例版本相同）"
             }
@@ -202,6 +206,7 @@ struct MigratorApp {
     bobby_choice: CacheChoice,
     pack_choice: PackChoice,
     blueprint_choice: PackChoice,
+    screenshot_choice: PackChoice,
     shared_dir: Option<PathBuf>,
     logs: Vec<LogEntry>,
     status: RunStatus,
@@ -228,6 +233,7 @@ impl MigratorApp {
             bobby_choice: CacheChoice::Skip,
             pack_choice: PackChoice::Skip,
             blueprint_choice: PackChoice::Skip,
+            screenshot_choice: PackChoice::LinkToShared,
             shared_dir: None,
             logs: Vec::new(),
             status: RunStatus::Idle,
@@ -295,7 +301,12 @@ impl MigratorApp {
 
     fn needs_shared_dir(&self) -> bool {
         [self.voxy_choice, self.bobby_choice].contains(&CacheChoice::LinkToShared)
-            || [self.pack_choice, self.blueprint_choice].contains(&PackChoice::LinkToShared)
+            || [
+                self.pack_choice,
+                self.blueprint_choice,
+                self.screenshot_choice,
+            ]
+            .contains(&PackChoice::LinkToShared)
     }
 
     fn build_request(&self) -> Result<MigrationRequest, String> {
@@ -312,6 +323,7 @@ impl MigratorApp {
         let bobby = self.bobby_choice.to_transfer(&self.shared_dir)?;
         let resource_packs = self.pack_choice.to_transfer(&self.shared_dir)?;
         let axiom_blueprints = self.blueprint_choice.to_transfer(&self.shared_dir)?;
+        let screenshots = self.screenshot_choice.to_transfer(&self.shared_dir)?;
         if !self.sync_options
             && !self.sync_mod_configs
             && !self.sync_maps
@@ -319,6 +331,7 @@ impl MigratorApp {
             && bobby.is_none()
             && resource_packs.is_none()
             && axiom_blueprints.is_none()
+            && screenshots.is_none()
         {
             return Err("请至少选择一项同步内容".to_string());
         }
@@ -333,6 +346,7 @@ impl MigratorApp {
             bobby,
             resource_packs,
             axiom_blueprints,
+            screenshots,
         })
     }
 
@@ -432,6 +446,7 @@ impl MigratorApp {
         self.voxy_choice = preset.cache_choice;
         self.bobby_choice = preset.cache_choice;
         self.blueprint_choice = PackChoice::Skip;
+        self.screenshot_choice = PackChoice::LinkToShared;
         self.push_log(LogLevel::Info, format!("已应用固定配置：{}", preset.name));
     }
 
@@ -534,10 +549,11 @@ impl MigratorApp {
             }
         });
 
-        section(ui, "材质包与蓝图", |ui| {
+        section(ui, "材质包、蓝图与截图", |ui| {
             for (kind, choice) in [
                 (SharedAsset::ResourcePacks, &mut self.pack_choice),
                 (SharedAsset::AxiomBlueprints, &mut self.blueprint_choice),
+                (SharedAsset::Screenshots, &mut self.screenshot_choice),
             ] {
                 field_label(ui, &kind.to_string());
                 show_pack_combo(ui, kind, choice);

@@ -96,6 +96,8 @@ pub struct MigrationRequest {
     pub resource_packs: Option<PackTransfer>,
     /// 为 `None` 时不处理 Axiom 蓝图。
     pub axiom_blueprints: Option<PackTransfer>,
+    /// 为 `None` 时不处理截图。
+    pub screenshots: Option<PackTransfer>,
 }
 
 /// 可复制或通过共享目录共用的玩家资源，冲突处理规则相同。
@@ -103,6 +105,7 @@ pub struct MigrationRequest {
 pub enum SharedAsset {
     ResourcePacks,
     AxiomBlueprints,
+    Screenshots,
 }
 
 impl fmt::Display for SharedAsset {
@@ -110,6 +113,7 @@ impl fmt::Display for SharedAsset {
         let label = match self {
             SharedAsset::ResourcePacks => "材质包",
             SharedAsset::AxiomBlueprints => "Axiom 蓝图",
+            SharedAsset::Screenshots => "截图",
         };
         f.write_str(label)
     }
