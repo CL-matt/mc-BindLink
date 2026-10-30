@@ -3,6 +3,7 @@
 mod engine;
 mod launcher;
 mod map_sync;
+mod pack_sync;
 #[cfg(test)]
 mod test_support;
 mod types;
@@ -11,14 +12,16 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
+use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use eframe::egui;
 
 use crate::types::{
-    CacheTransfer, DetectedInstance, MigrationRequest, MigrationResult, ServerCache, SyncMode,
+    CacheTransfer, ConflictChoice, DetectedInstance, MigrationRequest, MigrationResult,
+    PackConflict, PackTransfer, PackVersion, ServerCache, SyncMode,
 };
 
 const CJK_FONT_NAME: &str = "msyh";
@@ -39,7 +42,48 @@ fn main() -> eframe::Result {
 
 enum WorkerMessage {
     Log(String),
+    /// 后台线程遇到材质包同名冲突，阻塞等待界面通过附带的发送端回传用户选择。
+    Conflicts(Vec<PackConflict>, Sender<Vec<ConflictChoice>>),
     Finished(Result<MigrationResult>),
+}
+
+struct ConflictDialog {
+    conflicts: Vec<PackConflict>,
+    choices: Vec<ConflictChoice>,
+    reply: Sender<Vec<ConflictChoice>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackChoice {
+    Skip,
+    CopyMissing,
+    LinkToShared,
+}
+
+impl PackChoice {
+    const ALL: [PackChoice; 3] = [
+        PackChoice::Skip,
+        PackChoice::CopyMissing,
+        PackChoice::LinkToShared,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            PackChoice::Skip => "不处理",
+            PackChoice::CopyMissing => "复制缺少的材质包",
+            PackChoice::LinkToShared => "Junction 指向共享目录（同步启用列表）",
+        }
+    }
+
+    fn to_transfer(self, shared_dir: &Option<PathBuf>) -> Result<Option<PackTransfer>, String> {
+        Ok(match self {
+            PackChoice::Skip => None,
+            PackChoice::CopyMissing => Some(PackTransfer::CopyMissing),
+            PackChoice::LinkToShared => Some(PackTransfer::LinkToShared(
+                shared_dir.clone().ok_or("请先选择共享目录")?,
+            )),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +117,7 @@ impl CacheChoice {
             CacheChoice::Copy => Some(CacheTransfer::Copy),
             CacheChoice::LinkToSource => Some(CacheTransfer::LinkToSource),
             CacheChoice::LinkToShared => Some(CacheTransfer::LinkToShared(
-                shared_dir.clone().ok_or("请先选择缓存共享目录")?,
+                shared_dir.clone().ok_or("请先选择共享目录")?,
             )),
         })
     }
@@ -110,9 +154,11 @@ struct MigratorApp {
     sync_maps: bool,
     voxy_choice: CacheChoice,
     bobby_choice: CacheChoice,
+    pack_choice: PackChoice,
     shared_dir: Option<PathBuf>,
     logs: Vec<String>,
     worker: Option<Receiver<WorkerMessage>>,
+    conflict_dialog: Option<ConflictDialog>,
 }
 
 impl MigratorApp {
@@ -128,9 +174,11 @@ impl MigratorApp {
             sync_maps: false,
             voxy_choice: CacheChoice::Skip,
             bobby_choice: CacheChoice::Skip,
+            pack_choice: PackChoice::Skip,
             shared_dir: None,
             logs: Vec::new(),
             worker: None,
+            conflict_dialog: None,
         };
         if let Err(err) = install_cjk_font(ctx) {
             app.logs
@@ -173,11 +221,13 @@ impl MigratorApp {
         }
         let voxy = self.voxy_choice.to_transfer(&self.shared_dir)?;
         let bobby = self.bobby_choice.to_transfer(&self.shared_dir)?;
+        let resource_packs = self.pack_choice.to_transfer(&self.shared_dir)?;
         if !self.sync_options
             && !self.sync_mod_configs
             && !self.sync_maps
             && voxy.is_none()
             && bobby.is_none()
+            && resource_packs.is_none()
         {
             return Err("请至少选择一项同步内容".to_string());
         }
@@ -190,6 +240,7 @@ impl MigratorApp {
             sync_maps: self.sync_maps,
             voxy,
             bobby,
+            resource_packs,
         })
     }
 
@@ -210,7 +261,17 @@ impl MigratorApp {
                 sender.send(WorkerMessage::Log(message)).ok();
                 ctx.request_repaint();
             };
-            let outcome = engine::run_migration(&request, &mut log);
+            let mut resolve = |conflicts: Vec<PackConflict>| -> Result<Vec<ConflictChoice>> {
+                let (reply, answer) = mpsc::channel();
+                sender
+                    .send(WorkerMessage::Conflicts(conflicts, reply))
+                    .map_err(|_| anyhow!("界面已关闭，无法询问材质包冲突的处理方式"))?;
+                ctx.request_repaint();
+                answer
+                    .recv()
+                    .map_err(|_| anyhow!("未收到材质包冲突的处理选择"))
+            };
+            let outcome = engine::run_migration(&request, &mut resolve, &mut log);
             sender.send(WorkerMessage::Finished(outcome)).ok();
             ctx.request_repaint();
         });
@@ -225,6 +286,13 @@ impl MigratorApp {
         loop {
             match receiver.try_recv() {
                 Ok(WorkerMessage::Log(message)) => self.logs.push(message),
+                Ok(WorkerMessage::Conflicts(conflicts, reply)) => {
+                    self.conflict_dialog = Some(ConflictDialog {
+                        choices: vec![ConflictChoice::KeepExisting; conflicts.len()],
+                        conflicts,
+                        reply,
+                    });
+                }
                 Ok(WorkerMessage::Finished(outcome)) => {
                     match outcome {
                         Ok(result) if result.warnings.is_empty() => {
@@ -329,9 +397,20 @@ impl MigratorApp {
                 show_cache_combo(ui, kind, choice);
                 ui.end_row();
             }
+            ui.label("材质包");
+            egui::ComboBox::from_id_salt("pack_combo")
+                .width(520.0)
+                .selected_text(self.pack_choice.label())
+                .show_ui(ui, |ui| {
+                    for option in PackChoice::ALL {
+                        ui.selectable_value(&mut self.pack_choice, option, option.label());
+                    }
+                });
+            ui.end_row();
         });
-        let needs_shared_dir =
-            [self.voxy_choice, self.bobby_choice].contains(&CacheChoice::LinkToShared);
+        let needs_shared_dir = [self.voxy_choice, self.bobby_choice]
+            .contains(&CacheChoice::LinkToShared)
+            || self.pack_choice == PackChoice::LinkToShared;
         if needs_shared_dir {
             ui.horizontal(|ui| {
                 if ui.button("选择共享目录…").clicked()
@@ -344,6 +423,47 @@ impl MigratorApp {
                     None => ui.label("尚未选择"),
                 };
             });
+        }
+    }
+
+    fn show_conflict_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.conflict_dialog else {
+            return;
+        };
+        let mut confirmed = false;
+        egui::Modal::new(egui::Id::unique("pack_conflicts")).show(ctx, |ui| {
+            ui.heading("材质包同名冲突");
+            ui.label("以下材质包名称相同但内容不同，请逐个决定保留现有版本还是使用新版本。被替换的版本会移入 resourcepacks.bak 备份目录。");
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                for (conflict, choice) in dialog.conflicts.iter().zip(&mut dialog.choices) {
+                    ui.group(|ui| {
+                        ui.strong(&conflict.pack_name);
+                        ui.label(format!("现有：{}", describe_version(&conflict.existing)));
+                        ui.label(format!("新版本：{}", describe_version(&conflict.incoming)));
+                        ui.horizontal(|ui| {
+                            ui.radio_value(choice, ConflictChoice::KeepExisting, "保留现有");
+                            ui.radio_value(choice, ConflictChoice::UseIncoming, "使用新版本");
+                        });
+                    });
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("全部保留现有").clicked() {
+                    dialog.choices.fill(ConflictChoice::KeepExisting);
+                }
+                if ui.button("全部使用新版本").clicked() {
+                    dialog.choices.fill(ConflictChoice::UseIncoming);
+                }
+                if ui.button("确定").clicked() {
+                    confirmed = true;
+                }
+            });
+        });
+        if confirmed && let Some(dialog) = self.conflict_dialog.take() {
+            // 后台线程已结束时发送会失败，迁移结果会通过 Finished 消息另行报告
+            dialog.reply.send(dialog.choices).ok();
         }
     }
 
@@ -389,6 +509,38 @@ impl eframe::App for MigratorApp {
             ui.heading("日志");
             self.show_log_section(ui);
         });
+        self.show_conflict_dialog(&ctx);
+    }
+}
+
+fn describe_version(version: &PackVersion) -> String {
+    format!(
+        "{} · {} · {}",
+        version.owner,
+        format_size(version.size),
+        format_age(version.modified)
+    )
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= KB * KB {
+        format!("{:.1} MB", bytes / (KB * KB))
+    } else {
+        format!("{:.1} KB", bytes / KB)
+    }
+}
+
+/// 只显示相对天数，避免为本地时区换算引入新依赖。
+fn format_age(modified: Option<SystemTime>) -> String {
+    let Some(elapsed) = modified.and_then(|time| SystemTime::now().duration_since(time).ok())
+    else {
+        return "修改时间未知".to_string();
+    };
+    match elapsed.as_secs() / 86_400 {
+        0 => "今天修改".to_string(),
+        days => format!("{days} 天前修改"),
     }
 }
 

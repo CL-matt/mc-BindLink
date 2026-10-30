@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 /// 实例所属的启动器，仅用于界面展示，不参与实例判定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,44 @@ pub struct MigrationRequest {
     pub voxy: Option<CacheTransfer>,
     /// 为 `None` 时不处理 Bobby 缓存。
     pub bobby: Option<CacheTransfer>,
+    /// 为 `None` 时不处理材质包。
+    pub resource_packs: Option<PackTransfer>,
+}
+
+/// 材质包的迁移方式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackTransfer {
+    /// 把模板有而目标没有的材质包复制到目标。
+    CopyMissing,
+    /// 把模板与目标的材质包合并进共享目录，两个实例都建立 Junction 指向该目录。
+    LinkToShared(PathBuf),
+}
+
+/// 同名材质包冲突中的一方，供用户比较后决定保留哪个。
+#[derive(Debug, Clone)]
+pub struct PackVersion {
+    /// 所在实例名，或位于共享目录时为“共享目录”。
+    pub owner: String,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+}
+
+/// 两个同名但内容不同的材质包。
+#[derive(Debug, Clone)]
+pub struct PackConflict {
+    pub pack_name: String,
+    /// 已在目的位置的版本。
+    pub existing: PackVersion,
+    /// 准备放入目的位置的版本。
+    pub incoming: PackVersion,
+}
+
+/// 用户对单个材质包冲突的选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictChoice {
+    KeepExisting,
+    /// 现有版本移入备份目录，放入新版本。
+    UseIncoming,
 }
 
 /// 一次迁移的执行结果，供界面汇总展示。

@@ -11,7 +11,8 @@ use zip::ZipArchive;
 use zip::result::ZipError;
 
 use crate::map_sync;
-use crate::types::{MigrationRequest, MigrationResult, ServerCache, SyncMode};
+use crate::pack_sync::{self, ConflictResolver};
+use crate::types::{MigrationRequest, MigrationResult, PackTransfer, ServerCache, SyncMode};
 
 const OPTIONS_FILE_NAME: &str = "options.txt";
 const KEY_PREFIX: &str = "key_";
@@ -30,6 +31,8 @@ const FULL_OVERWRITE_BLACKLIST: &[&str] = &[
     "lastServer",
 ];
 const MAX_TIMESTAMPED_BACKUPS: usize = 5;
+/// `options.txt` 中记录已启用材质包的条目。
+const ENABLED_PACK_KEYS: &[&str] = &["resourcePacks", "incompatibleResourcePacks"];
 
 /// 独立 Mod 配置文件的同步规则：目标实例安装了 `mod_id` 时才处理 `relative_path`。
 struct ModConfigRule {
@@ -51,6 +54,7 @@ const MOD_CONFIG_RULES: &[ModConfigRule] = &[ModConfigRule {
 /// 使按键同步不会因为地图或缓存的问题而中断。
 pub fn run_migration(
     request: &MigrationRequest,
+    resolve: &mut ConflictResolver,
     log: &mut dyn FnMut(String),
 ) -> Result<MigrationResult> {
     let template_dir = &request.template.game_dir;
@@ -88,6 +92,22 @@ pub fn run_migration(
         let outcome = map_sync::transfer_server_caches(kind, template_dir, target_dir, method, log)
             .map(|step| merge_result(&mut result, step));
         record_step_failure(&format!("{kind} 缓存迁移"), outcome, log, &mut result);
+    }
+    if let Some(method) = &request.resource_packs {
+        let outcome = pack_sync::sync_resource_packs(
+            &request.template,
+            &request.target,
+            method,
+            resolve,
+            log,
+        )
+        .map(|step| merge_result(&mut result, step));
+        record_step_failure("材质包同步", outcome, log, &mut result);
+        // 只有共享目录保证两个实例拥有相同的材质包文件，启用列表才能安全照搬
+        if matches!(method, PackTransfer::LinkToShared(_)) {
+            let outcome = sync_enabled_pack_list(template_dir, target_dir, log, &mut result);
+            record_step_failure("材质包启用列表同步", outcome, log, &mut result);
+        }
     }
 
     log(format!(
@@ -341,6 +361,43 @@ fn sync_options_file(
     fs::write(&target_path, target.to_text())
         .with_context(|| format!("写入 {} 失败", target_path.display()))?;
     log(format!("options.txt：更新 {changed} 个条目"));
+    result.changed_paths.push(target_path);
+    Ok(())
+}
+
+/// 把模板 `options.txt` 中的材质包启用列表写入目标，目标没有 `options.txt` 时跳过。
+fn sync_enabled_pack_list(
+    template_dir: &Path,
+    target_dir: &Path,
+    log: &mut dyn FnMut(String),
+    result: &mut MigrationResult,
+) -> Result<()> {
+    let template_path = template_dir.join(OPTIONS_FILE_NAME);
+    let target_path = target_dir.join(OPTIONS_FILE_NAME);
+    if !template_path.is_file() || !target_path.is_file() {
+        log("材质包启用列表：模板或目标缺少 options.txt，跳过".to_string());
+        return Ok(());
+    }
+    let template = OptionsFile::load(&template_path)?;
+    let mut target = OptionsFile::load(&target_path)?;
+    let mut changed = 0;
+    for key in ENABLED_PACK_KEYS {
+        if let Some(value) = template.get(key)
+            && target.set(key, value)
+        {
+            changed += 1;
+        }
+    }
+    if changed == 0 {
+        log("材质包启用列表：与模板一致，无需修改".to_string());
+        return Ok(());
+    }
+    if let Some(backup) = backup_file_safely(&target_path)? {
+        log(format!("已备份到 {}", backup.display()));
+    }
+    fs::write(&target_path, target.to_text())
+        .with_context(|| format!("写入 {} 失败", target_path.display()))?;
+    log("材质包启用列表：已按模板更新".to_string());
     result.changed_paths.push(target_path);
     Ok(())
 }
@@ -781,6 +838,33 @@ mod tests {
             &destination,
             SyncMode::Merge
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_pack_list_follows_template() -> Result<()> {
+        let template = TempDir::new("packlist-template")?;
+        let target = TempDir::new("packlist-target")?;
+        fs::write(
+            template.path().join("options.txt"),
+            "resourcePacks:[\"vanilla\",\"file/a.zip\"]\nincompatibleResourcePacks:[]\nfov:1.0\n",
+        )?;
+        fs::write(
+            target.path().join("options.txt"),
+            "fov:0.0\nresourcePacks:[\"vanilla\"]\n",
+        )?;
+
+        let mut result = MigrationResult::default();
+        sync_enabled_pack_list(template.path(), target.path(), &mut no_log(), &mut result)?;
+
+        let updated = OptionsFile::load(&target.path().join("options.txt"))?;
+        assert_eq!(
+            updated.get("resourcePacks"),
+            Some("[\"vanilla\",\"file/a.zip\"]")
+        );
+        assert_eq!(updated.get("incompatibleResourcePacks"), Some("[]"));
+        assert_eq!(updated.get("fov"), Some("0.0"));
+        assert!(target.path().join("options.txt.bak").is_file());
         Ok(())
     }
 }

@@ -291,7 +291,7 @@ fn prepare_shared_cache(
 }
 
 /// 解析链接后的真实路径，并去掉 `canonicalize` 附加的 `\\?\` 前缀，使其可直接传给 `mklink`。
-fn resolve_real_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_real_path(path: &Path) -> Result<PathBuf> {
     let canonical =
         fs::canonicalize(path).with_context(|| format!("解析路径 {} 失败", path.display()))?;
     let text = canonical.to_string_lossy();
@@ -301,7 +301,7 @@ fn resolve_real_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn is_link(path: &Path) -> Result<bool> {
+pub(crate) fn is_link(path: &Path) -> Result<bool> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("读取 {} 的属性失败", path.display()))?;
     Ok(metadata.file_type().is_symlink())
@@ -311,7 +311,7 @@ fn is_link(path: &Path) -> Result<bool> {
 ///
 /// 游戏运行时会一直打开正在读写的缓存文件（Voxy 的 RocksDB、Bobby 的区块文件），
 /// 据此判断对应实例是否正在运行。
-fn ensure_cache_not_in_use(cache_dir: &Path) -> Result<()> {
+pub(crate) fn ensure_cache_not_in_use(cache_dir: &Path) -> Result<()> {
     for entry in WalkDir::new(cache_dir) {
         let entry = entry.with_context(|| format!("遍历 {} 失败", cache_dir.display()))?;
         if !entry.file_type().is_file() {
@@ -339,7 +339,7 @@ fn ensure_cache_not_in_use(cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rename_aside(path: &Path) -> Result<PathBuf> {
+pub(crate) fn rename_aside(path: &Path) -> Result<PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| anyhow!("无法取得目录名：{}", path.display()))?
@@ -357,7 +357,7 @@ fn rename_aside(path: &Path) -> Result<PathBuf> {
     Ok(backup)
 }
 
-fn move_dir(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn move_dir(from: &Path, to: &Path) -> Result<()> {
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
         // 共享目录位于其他磁盘时无法直接重命名，改为复制后删除源目录
@@ -371,7 +371,7 @@ fn move_dir(from: &Path, to: &Path) -> Result<()> {
     }
 }
 
-fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     for entry in WalkDir::new(source) {
         let entry = entry.with_context(|| format!("遍历 {} 失败", source.display()))?;
         let target = destination.join(entry.path().strip_prefix(source)?);
@@ -392,7 +392,7 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
 }
 
 /// 通过 `mklink /J` 创建目录 Junction，无需管理员权限或开发者模式。
-fn create_junction(link: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn create_junction(link: &Path, destination: &Path) -> Result<()> {
     // mklink 不接受 `/` 分隔符，而 Path::join 拼接相对路径时会保留它
     let to_native = |path: &Path| path.to_string_lossy().replace('/', "\\");
     let output = Command::new("cmd")
