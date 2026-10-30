@@ -126,7 +126,7 @@
   - IO / 压缩：`zip`, `walkdir`, `anyhow`, `flate2`（解压 Axiom 蓝图的 gzip 方块数据；已是 `zip` 的间接依赖，经用户批准改为直接依赖）, `image`（仅开启 `png` 特性，解码标题栏的 LorianTool 图标；已是 eframe 的间接依赖，经用户批准改为直接依赖）
 
 ### 文件模块组织
-- `src/main.rs`: 界面逻辑、状态存储、事件处理与日志流展示。界面为左右分栏：左侧可滚动的分组卡片（实例、固定配置、按键与配置、地图与缓存、材质包与蓝图、按需出现的共享目录），右侧为按级别着色的日志，底部操作栏放置状态与"开始迁移"按钮；主题默认跟随系统，右上角可切换浅色或深色；主题按钮左侧为 GitHub 仓库（https://github.com/CL-matt/mc-bindsync）与 LorianTool（https://tools.voxisle.art/）链接按钮，LorianTool 图标取自 `logos/logo-square-LorianTool.png` 并编译进程序；标题栏左侧显示软件标志与名称，窗口标题与任务栏图标同样使用 BindLink 标志。
+- `src/main.rs`: 界面逻辑、状态存储、事件处理与日志流展示。界面为左右分栏：左侧可滚动的分组卡片（实例、固定配置、按键与配置、地图与缓存、材质包与蓝图、按需出现的共享目录），右侧为按级别着色的日志，底部操作栏放置状态与"开始迁移"按钮；主题默认跟随系统，右上角可切换浅色或深色；主题按钮左侧为 GitHub 仓库（https://github.com/CL-matt/mc-bindsync）与 LorianTool（https://tools.voxisle.art/）链接按钮，LorianTool 图标取自 `logos/logo-square-LorianTool.png`，该图标需要授权，已加入 `.gitignore` 不随仓库分发；`build.rs` 检测到本地存在该文件时开启 `has_lorian_tool_logo` 并编译进程序，否则按钮只显示文字，两种情况都能正常编译；标题栏左侧显示软件标志与名称，窗口标题与任务栏图标同样使用 BindLink 标志。
 - `src/engine.rs`: 核心业务逻辑（`options.txt` 解析、Mod 检测、配置读写与备份）。
 - `src/launcher.rs`: 启动器路径嗅探、隔离版本扫描。
 - `src/map_sync.rs`: 地图路点目录递归同步与 Voxy、Bobby 缓存链接或拷贝；同时提供 Junction、移动、占用检测等目录操作供 `pack_sync.rs` 复用。

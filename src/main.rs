@@ -28,7 +28,12 @@ const CJK_FONT_NAME: &str = "msyh";
 const ACCENT: Color32 = Color32::from_rgb(76, 145, 98);
 const GITHUB_URL: &str = "https://github.com/CL-matt/mc-bindsync";
 const LORIAN_TOOL_URL: &str = "https://tools.voxisle.art/";
-const LORIAN_TOOL_LOGO: &[u8] = include_bytes!("../logos/logo-square-LorianTool.png");
+/// LorianTool 图标需要授权，仓库不包含该文件；`build.rs` 检测到本地存在时才编译进程序，
+/// 否则链接按钮只显示文字。
+#[cfg(has_lorian_tool_logo)]
+const LORIAN_TOOL_LOGO: Option<&[u8]> = Some(include_bytes!("../logos/logo-square-LorianTool.png"));
+#[cfg(not(has_lorian_tool_logo))]
+const LORIAN_TOOL_LOGO: Option<&[u8]> = None;
 const APP_LOGO: &[u8] = include_bytes!("../logos/bindlink-256.png");
 const APP_NAME: &str = "BindLink 键链";
 /// 取自 Cargo.toml，版本号只需在那里维护。
@@ -202,7 +207,7 @@ struct MigratorApp {
     status: RunStatus,
     worker: Option<Receiver<WorkerMessage>>,
     conflict_dialog: Option<ConflictDialog>,
-    /// 解码失败时为 `None`，标题栏改为只显示文字链接。
+    /// 未编译进图标或解码失败时为 `None`，标题栏改为只显示文字链接。
     lorian_logo: Option<egui::TextureHandle>,
     /// 解码失败时为 `None`，标题栏只显示软件名称。
     app_logo: Option<egui::TextureHandle>,
@@ -241,12 +246,14 @@ impl MigratorApp {
                 format!("加载中文字体失败，界面文字可能无法显示：{err:#}"),
             );
         }
-        match load_logo_texture(ctx, "lorian_tool_logo", LORIAN_TOOL_LOGO) {
-            Ok(texture) => app.lorian_logo = Some(texture),
-            Err(err) => app.push_log(
-                LogLevel::Warning,
-                format!("加载 LorianTool 图标失败：{err:#}"),
-            ),
+        if let Some(bytes) = LORIAN_TOOL_LOGO {
+            match load_logo_texture(ctx, "lorian_tool_logo", bytes) {
+                Ok(texture) => app.lorian_logo = Some(texture),
+                Err(err) => app.push_log(
+                    LogLevel::Warning,
+                    format!("加载 LorianTool 图标失败：{err:#}"),
+                ),
+            }
         }
         match load_logo_texture(ctx, "app_logo", APP_LOGO) {
             Ok(texture) => app.app_logo = Some(texture),
@@ -945,7 +952,8 @@ mod tests {
     #[test]
     fn embedded_logos_decode() -> Result<()> {
         let ctx = egui::Context::default();
-        for (name, bytes) in [("lorian", LORIAN_TOOL_LOGO), ("app", APP_LOGO)] {
+        let logos = [("lorian", LORIAN_TOOL_LOGO), ("app", Some(APP_LOGO))];
+        for (name, bytes) in logos.into_iter().filter_map(|(n, b)| b.map(|b| (n, b))) {
             let [width, height] = load_logo_texture(&ctx, name, bytes)?.size();
             assert!(width > 0 && height > 0, "{name}");
         }

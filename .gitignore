@@ -25,3 +25,6 @@ rustc-ice-*.txt
 
 # 本地参考样本（用户自己的 options.txt），不纳入版本管理
 exemp/
+
+# LorianTool 图标需要授权，仅保留在本地，不随仓库分发
+logos/logo-square-LorianTool.png
