@@ -3,7 +3,7 @@
 ## 1. 项目定位与目标
 - **核心诉求**：解决玩家在跨版本（如 1.20 到 1.21 等）、切整合包时需重复设置大量按键的痛点。
 - **形态方案**：基于 **Rust (eframe / egui)** 构建的单文件独立桌面应用（零运行时依赖、秒级冷启动、极小分发体积）。
-- **支持启动器**：深度适配国内主流的 **HMCL** 与 **PCL2**，兼容全局根目录与版本隔离实例。
+- **支持启动器**：适配国内主流的 **PCL2**，兼容全局根目录与版本隔离实例；HMCL 适配列入 [todolist.md](todolist.md)。
 
 ---
 
@@ -13,20 +13,19 @@
 - **扫描源**：
   1. 用户选择目录
   2. 程序当前工作目录及其父级的 `.minecraft`
-  3. 启动器配置中登记的游戏目录（可选，读取或解析失败时跳过并记录日志）：
-     - HMCL：`%APPDATA%\.hmcl\hmcl.json` 与 HMCL 同目录下的 `hmcl.json`
-     - PCL2：PCL 同目录下 `PCL\Setup.ini` 的 `LaunchFolders` 项
-     - 上述文件格式需用真实安装验证后再实现解析
+  - 启动器配置中登记的游戏目录暂不作为扫描源，见 [todolist.md](todolist.md)。
 - **版本隔离识别**：
   - 深度检索 `.minecraft/versions/<Version_Name>/`，仅当该目录下存在 `<Version_Name>.json` 时视为合法版本。
   - 合法版本目录下存在独立 `options.txt` 或 `mods/` 目录时识别为隔离实例，否则归入根目录 `.minecraft` 的共享配置。
-- **启动器标注**：版本目录下存在 `hmclversion.cfg` 标注为 HMCL，存在 `PCL/` 子目录标注为 PCL2，否则标注为 Unknown；标注结果仅用于界面展示，不参与实例判定。
+- **启动器标注**：版本目录下存在 `PCL/` 子目录标注为 PCL2，否则标注为 Unknown；标注结果仅用于界面展示，不参与实例判定。
 
 ### 2.2 Mod ID 扫描机制 (Mod Detection)
 - 遍历目标实例 `mods/` 目录下的所有 `.jar` 文件。
 - 解析内部元数据，而非匹配文件名：
-  - **Fabric / Quilt**：解压读取 `fabric.mod.json` 中的 `id` 字段。
-  - **Forge / NeoForge**：解压读取 `META-INF/mods.toml` 中的 `modId` 字段。
+  - **Fabric**：解压读取 `fabric.mod.json` 中的 `id` 字段。
+  - **Quilt**：解压读取 `quilt.mod.json` 中的 `quilt_loader.id` 字段。
+  - **Forge / NeoForge**：解压读取 `META-INF/mods.toml` 或 `META-INF/neoforge.mods.toml`（NeoForge 1.20.5 起使用，已在 1.21.1 NeoForge 实例中实测）中 `[[mods]]` 的 `modId` 字段；跳过未经构建替换的 `${...}` 占位符。
+- 只扫描扩展名为 `.jar` 的文件，`.jar.disabled` 等已禁用的 Mod 不计入。
 - 产出集合：`HashSet<String>`，供后续精准触发特定 Mod 配置规则。
 
 ### 2.3 双同步模式设计 (Sync Modes)
@@ -48,17 +47,19 @@
   - 独立 Mod 配置文件：直接全量替换为模板配置，或全字段覆盖。
 - **跨版本保护（两种模式通用）**：
   - `options.txt` 的 `version` 条目任何模式下都不复制。
-  - 1.13 之前的按键使用数字键码，与新版 `key.keyboard.*` 格式不兼容；模板与目标分处 1.13 两侧时拒绝迁移按键条目，并在日志中说明原因。
+  - 1.13 之前的按键使用数字键码，与新版 `key.keyboard.*` 格式不兼容；模板与目标分处 1.13 两侧时拒绝迁移按键条目，并在日志中说明原因。判定依据为 `version` 数据版本号是否小于 1519（1.13 正式版），缺少 `version` 时按 `key_` 条目的值是否为纯数字判断。
+  - 目标实例不存在 `options.txt` 时跳过并给出警告，提示用户先启动一次游戏：新文件缺少 `version` 条目会让游戏按最旧格式升级配置，而 `version` 又禁止从模板复制。
 
 ### 2.4 独立 Mod 适配策略
-- **Axiom (JSON)**：文件路径 `config/axiom.json`。合并模式下提取 `keybinds` 字段进行局部替换。
+- 仅当目标实例 `mods/` 中识别到对应 Mod ID 时才处理该 Mod 的配置文件。
+- **Axiom (JSON)**：Mod ID `axiom`，文件路径 `config/axiom/axiom.json`（已在 PCL 实例中实测）。合并模式下仅替换顶层 `keybinds` 字段；目标文件不存在时复制整个模板文件。
 
 ### 2.5 独立地图与缓存同步器 (`map_sync.rs`)
-- **常规地图与路点 (Xaero / JourneyMap)**：
+- **常规地图与路点 (Xaero)**：
   - 目录：
     - Xaero 新版（已在 PCL 实例中实测）：`xaero/minimap/<世界键>/`（路点）与 `xaero/world-map/<世界键>/`（地图）。
     - Xaero 旧版：`XaeroWaypoints`, `XaeroWorldMap`。
-    - JourneyMap：`journeymap`（尚未实测目录结构）。
+    - JourneyMap 适配列入 [todolist.md](todolist.md)。
     - `<世界键>` 为单人世界存档名，或 `Multiplayer_<服务器地址>`（如 `Multiplayer_example.com`）。
   - 策略：以 `<世界键>` 为单位进行文件夹级无损递归同步：
     - 目标缺少的文件直接复制。
@@ -73,7 +74,9 @@
     - Junction 指向共享目录：先把源缓存移动到用户选择的共享目录，再让源与目标都链接到该目录；适用于同一服务器反复更新整合包的场景，新版本整合包只需重新建立链接。
   - Junction 通过 `cmd /c mklink /J` 创建，不需要管理员权限或开发者模式，也不引入新依赖。
   - 目标已存在同名缓存目录时，先重命名为 `<目录名>.<unix秒>.bak` 再复制或建立链接，禁止直接删除。
-  - RocksDB 在游戏运行时持有文件锁：复制或移动缓存前必须确认对应实例未在运行，否则中止并记录日志；共享同一份缓存的多个实例不能同时运行。
+  - RocksDB 在游戏运行时持有文件锁：复制或移动缓存前必须确认对应实例未在运行，否则中止并记录日志；共享同一份缓存的多个实例不能同时运行。判定方式为以不共享模式打开缓存目录下的 `LOCK` 文件，打开失败即视为正在运行。
+  - 源缓存本身已是指向其他位置的链接时，拒绝移动到共享目录，提示改用"Junction 指向源实例"，避免其他实例的链接失效。
+  - 源缓存移动到共享目录后，若源实例的链接建立失败，必须把缓存移回原处。
 
 ---
 
@@ -82,7 +85,7 @@
 - **语言版本**：Rust
 - **核心依赖**：
   - GUI：`eframe`, `rfd`
-  - 格式解析：`serde`, `serde_json`, `toml_edit`
+  - 格式解析：`serde_json`（开启 `preserve_order`，写回 JSON 时保持字段顺序）, `toml_edit`
   - IO / 压缩：`zip`, `walkdir`, `anyhow`
 
 ### 文件模块组织
@@ -93,7 +96,13 @@
 - `src/types.rs`: 全局公用枚举与数据结构定义。
 
 ### 核心数据结构
-- `DetectedInstance` 包含 `launcher: LauncherKind` 字段，`LauncherKind` 取值为 `Hmcl / Pcl2 / Unknown`，定义在 `src/types.rs`。
+- `DetectedInstance` 包含 `launcher: LauncherKind` 字段，`LauncherKind` 取值为 `Pcl2 / Unknown`，定义在 `src/types.rs`。
+- `src/test_support.rs` 仅在测试编译时引入，提供测试用临时目录。
+
+### 开发环境
+- 工具链：rustup `stable-x86_64-pc-windows-gnu`，安装在 `<工具链目录>`（`RUSTUP_HOME`、`CARGO_HOME` 为用户级环境变量）。
+- `windows` 系列依赖以 raw-dylib 方式链接，需要完整 MinGW-w64 提供的 `dlltool` 与 `as`：使用 WinLibs（GCC 16.2.0，UCRT），位于 `<工具链目录>\mingw64`，其 `bin` 已加入用户 PATH。
+- 构建产物目录由 `.cargo/config.toml` 指向 `<构建目录>`，避开 网盘 同步。
 
 ---
 
