@@ -40,7 +40,8 @@ const APP_NAME: &str = "BindLink 键链";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEADER_ICON_SIZE: f32 = 18.0;
 const HEADER_LOGO_SIZE: f32 = 28.0;
-/// 默认共享目录建在模板实例的 `.minecraft` 下，与实例同盘，首次共享时移动缓存只需改名。
+/// 默认共享目录建在目标实例的 `.minecraft` 下，即迁移后继续使用的实例旁边；
+/// 模板实例在其他磁盘时，首次共享会把缓存复制过去后删除原目录。
 const DEFAULT_SHARED_DIR_NAME: &str = "bindlink-shared";
 
 fn main() -> eframe::Result {
@@ -209,7 +210,7 @@ struct MigratorApp {
     pack_choice: PackChoice,
     blueprint_choice: PackChoice,
     screenshot_choice: PackChoice,
-    /// 用户手动选择的共享目录，为 `None` 时使用模板实例的默认共享目录。
+    /// 用户手动选择的共享目录，为 `None` 时使用目标实例的默认共享目录。
     shared_dir: Option<PathBuf>,
     logs: Vec<LogEntry>,
     status: RunStatus,
@@ -313,8 +314,8 @@ impl MigratorApp {
     }
 
     fn default_shared_dir(&self) -> Option<PathBuf> {
-        self.selected_instance(self.template_index)
-            .map(|template| template.minecraft_root.join(DEFAULT_SHARED_DIR_NAME))
+        self.selected_instance(self.target_index)
+            .map(|target| target.minecraft_root.join(DEFAULT_SHARED_DIR_NAME))
     }
 
     /// 本次迁移实际使用的共享目录；目录不存在时由各同步步骤在用到时创建。
@@ -588,7 +589,7 @@ impl MigratorApp {
                     }
                     (None, None) => {
                         ui.label(
-                            RichText::new("选择模板实例后显示默认位置")
+                            RichText::new("选择目标实例后显示默认位置")
                                 .color(ui.visuals().warn_fg_color),
                         );
                     }

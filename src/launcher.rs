@@ -171,6 +171,30 @@ mod tests {
     }
 
     #[test]
+    fn scans_instances_from_multiple_selected_roots() -> Result<()> {
+        let first = TempDir::new("launcher-root-a")?;
+        let second = TempDir::new("launcher-root-b")?;
+        let pack_a = create_version(&first.path().join(MINECRAFT_DIR_NAME), "pack-a")?;
+        fs::write(pack_a.join("options.txt"), "")?;
+        let pack_b = create_version(&second.path().join(MINECRAFT_DIR_NAME), "pack-b")?;
+        fs::write(pack_b.join("options.txt"), "")?;
+
+        let instances = scan_all_instances(
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+            &mut LogSink::new(&mut |_| {}),
+        );
+
+        for (dir, root) in [(pack_a, first.path()), (pack_b, second.path())] {
+            let found = instances
+                .iter()
+                .find(|instance| instance.game_dir == dir)
+                .ok_or_else(|| anyhow::anyhow!("未找到 {}", dir.display()))?;
+            assert_eq!(found.minecraft_root, root.join(MINECRAFT_DIR_NAME));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn resolves_root_from_parent_or_version_dir() -> Result<()> {
         let base = TempDir::new("launcher-resolve")?;
         let root = base.path().join(MINECRAFT_DIR_NAME);
