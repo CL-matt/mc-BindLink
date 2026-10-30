@@ -1,8 +1,10 @@
-# 项目记忆文档: Minecraft 按键与配置迁移器 (MC Keybind Migrator)
+# 项目记忆文档: BindLink 键链（Minecraft 按键与配置迁移器）
 
 ## 1. 项目定位与目标
 - **核心诉求**：解决玩家在跨版本（如 1.20 到 1.21 等）、切整合包时需重复设置大量按键的痛点。
 - **形态方案**：基于 **Rust (eframe / egui)** 构建的单文件独立桌面应用（零运行时依赖、秒级冷启动、极小分发体积）。
+- **软件名称**：BindLink，中文名"键链"，取"按键绑定（Bind）+ 链接（Link）"之意；仓库名与 Cargo 包名保持 `mc-bindsync`。
+- **标志**：两个互扣的圆角方形键帽，绿色 `#4C9162` 代表模板实例，深灰 `#2F3B45` 代表目标实例，右上交叉处绿色压在深灰之上形成链环。矢量原稿为 `logos/bindlink.svg`（64×64 视图），`logos/bindlink-256.png` 按同一几何参数绘制，用作窗口图标与标题栏标志；修改标志时两者必须同步更新。
 - **支持启动器**：适配国内主流的 **PCL2**，兼容全局根目录与版本隔离实例；HMCL 适配列入 [todolist.md](todolist.md)。
 
 ---
@@ -123,7 +125,7 @@
   - IO / 压缩：`zip`, `walkdir`, `anyhow`, `flate2`（解压 Axiom 蓝图的 gzip 方块数据；已是 `zip` 的间接依赖，经用户批准改为直接依赖）, `image`（仅开启 `png` 特性，解码标题栏的 LorianTool 图标；已是 eframe 的间接依赖，经用户批准改为直接依赖）
 
 ### 文件模块组织
-- `src/main.rs`: 界面逻辑、状态存储、事件处理与日志流展示。界面为左右分栏：左侧可滚动的分组卡片（实例、固定配置、按键与配置、地图与缓存、材质包与蓝图、按需出现的共享目录），右侧为按级别着色的日志，底部操作栏放置状态与"开始迁移"按钮；主题默认跟随系统，右上角可切换浅色或深色；主题按钮左侧为 GitHub 仓库（https://github.com/CL-matt/mc-bindsync）与 LorianTool（https://tools.voxisle.art/）链接按钮，LorianTool 图标取自 `logos/logo-square-LorianTool.png` 并编译进程序。
+- `src/main.rs`: 界面逻辑、状态存储、事件处理与日志流展示。界面为左右分栏：左侧可滚动的分组卡片（实例、固定配置、按键与配置、地图与缓存、材质包与蓝图、按需出现的共享目录），右侧为按级别着色的日志，底部操作栏放置状态与"开始迁移"按钮；主题默认跟随系统，右上角可切换浅色或深色；主题按钮左侧为 GitHub 仓库（https://github.com/CL-matt/mc-bindsync）与 LorianTool（https://tools.voxisle.art/）链接按钮，LorianTool 图标取自 `logos/logo-square-LorianTool.png` 并编译进程序；标题栏左侧显示软件标志与名称，窗口标题与任务栏图标同样使用 BindLink 标志。
 - `src/engine.rs`: 核心业务逻辑（`options.txt` 解析、Mod 检测、配置读写与备份）。
 - `src/launcher.rs`: 启动器路径嗅探、隔离版本扫描。
 - `src/map_sync.rs`: 地图路点目录递归同步与 Voxy、Bobby 缓存链接或拷贝；同时提供 Junction、移动、占用检测等目录操作供 `pack_sync.rs` 复用。

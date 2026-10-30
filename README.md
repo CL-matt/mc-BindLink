@@ -1,6 +1,8 @@
-# bindsync
+<img src="logos/bindlink.svg" alt="BindLink 标志" width="96">
 
-bindsync 是一个 Windows 桌面工具，把一个 Minecraft 实例里的按键、选项、Mod 配置、地图路点、Voxy 与 Bobby 缓存迁移到另一个实例。换整合包、升级版本或拿到朋友的客户端时，不用再手动重设几十个按键。
+# BindLink 键链
+
+BindLink（键链）是一个 Windows 桌面工具，把一个 Minecraft 实例里的按键、选项、Mod 配置、地图路点、Voxy 与 Bobby 缓存迁移到另一个实例。换整合包、升级版本或拿到朋友的客户端时，不用再手动重设几十个按键。
 
 ## 功能
 
@@ -94,6 +96,6 @@ cargo build --release
 | `src/pack_sync.rs` | 材质包与 Axiom 蓝图的复制、共享与冲突处理 |
 | `src/types.rs` | 公用数据结构 |
 | `mem.md` | 项目设计与同步规则 |
-| `logos/` | 界面使用的图标，编译时嵌入程序 |
+| `logos/` | 软件标志 `bindlink.svg` 与其 256 px PNG 版本（窗口图标与标题栏使用），以及 LorianTool 图标；PNG 编译时嵌入程序 |
 | `todolist.md` | 待实现功能 |
 | `CLAUDE.md`、`docs/` | 开发规范 |
