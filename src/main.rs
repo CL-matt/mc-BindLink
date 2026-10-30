@@ -29,19 +29,35 @@ const ACCENT: Color32 = Color32::from_rgb(76, 145, 98);
 const GITHUB_URL: &str = "https://github.com/CL-matt/mc-bindsync";
 const LORIAN_TOOL_URL: &str = "https://tools.voxisle.art/";
 const LORIAN_TOOL_LOGO: &[u8] = include_bytes!("../logos/logo-square-LorianTool.png");
+const APP_LOGO: &[u8] = include_bytes!("../logos/bindlink-256.png");
+const APP_NAME: &str = "BindLink 键链";
 const HEADER_ICON_SIZE: f32 = 18.0;
+const HEADER_LOGO_SIZE: f32 = 28.0;
 
 fn main() -> eframe::Result {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1080.0, 720.0])
+        .with_min_inner_size([820.0, 560.0]);
+    // 窗口创建前还没有日志区，图标解码失败的原因留到界面启动后写入日志
+    let icon_error = match decode_png(APP_LOGO) {
+        Ok(image) => {
+            viewport = viewport.with_icon(Arc::new(egui::IconData {
+                width: image.width(),
+                height: image.height(),
+                rgba: image.into_raw(),
+            }));
+            None
+        }
+        Err(err) => Some(format!("加载窗口图标失败：{err:#}")),
+    };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1080.0, 720.0])
-            .with_min_inner_size([820.0, 560.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
-        "MC 按键与配置迁移",
+        APP_NAME,
         options,
-        Box::new(|cc| Ok(Box::new(MigratorApp::new(&cc.egui_ctx)))),
+        Box::new(|cc| Ok(Box::new(MigratorApp::new(&cc.egui_ctx, icon_error)))),
     )
 }
 
@@ -184,10 +200,12 @@ struct MigratorApp {
     conflict_dialog: Option<ConflictDialog>,
     /// 解码失败时为 `None`，标题栏改为只显示文字链接。
     lorian_logo: Option<egui::TextureHandle>,
+    /// 解码失败时为 `None`，标题栏只显示软件名称。
+    app_logo: Option<egui::TextureHandle>,
 }
 
 impl MigratorApp {
-    fn new(ctx: &egui::Context) -> Self {
+    fn new(ctx: &egui::Context, icon_error: Option<String>) -> Self {
         let mut app = Self {
             selected_dirs: Vec::new(),
             instances: Vec::new(),
@@ -207,20 +225,28 @@ impl MigratorApp {
             worker: None,
             conflict_dialog: None,
             lorian_logo: None,
+            app_logo: None,
         };
         apply_style(ctx);
+        if let Some(message) = icon_error {
+            app.push_log(LogLevel::Warning, message);
+        }
         if let Err(err) = install_cjk_font(ctx) {
             app.push_log(
                 LogLevel::Warning,
                 format!("加载中文字体失败，界面文字可能无法显示：{err:#}"),
             );
         }
-        match load_logo_texture(ctx) {
+        match load_logo_texture(ctx, "lorian_tool_logo", LORIAN_TOOL_LOGO) {
             Ok(texture) => app.lorian_logo = Some(texture),
             Err(err) => app.push_log(
                 LogLevel::Warning,
                 format!("加载 LorianTool 图标失败：{err:#}"),
             ),
+        }
+        match load_logo_texture(ctx, "app_logo", APP_LOGO) {
+            Ok(texture) => app.app_logo = Some(texture),
+            Err(err) => app.push_log(LogLevel::Warning, format!("加载软件图标失败：{err:#}")),
         }
         app.rescan_instances();
         app
@@ -400,7 +426,13 @@ impl MigratorApp {
 
     fn show_header(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("MC 按键与配置迁移").size(20.0).strong());
+            if let Some(texture) = &self.app_logo {
+                ui.add(
+                    egui::Image::new(egui::load::SizedTexture::from_handle(texture))
+                        .fit_to_exact_size(egui::vec2(HEADER_LOGO_SIZE, HEADER_LOGO_SIZE)),
+                );
+            }
+            ui.label(RichText::new(APP_NAME).size(20.0).strong());
             ui.label(RichText::new("把按键、配置、地图与缓存迁移到新实例").weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 egui::widgets::global_theme_preference_buttons(ui);
@@ -730,14 +762,20 @@ fn show_link_button(ui: &mut egui::Ui, button: egui::Button, url: &str) {
     }
 }
 
-/// 把内嵌的 PNG 图标解码为纹理；egui 本身不解码 PNG，借助 `image` 完成。
-fn load_logo_texture(ctx: &egui::Context) -> Result<egui::TextureHandle> {
-    let rgba = image::load_from_memory_with_format(LORIAN_TOOL_LOGO, image::ImageFormat::Png)
-        .context("PNG 解码失败")?
-        .to_rgba8();
+/// 解码内嵌的 PNG 图标；egui 本身不解码 PNG，借助 `image` 完成。
+fn decode_png(bytes: &[u8]) -> Result<image::RgbaImage> {
+    Ok(
+        image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+            .context("PNG 解码失败")?
+            .to_rgba8(),
+    )
+}
+
+fn load_logo_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Result<egui::TextureHandle> {
+    let rgba = decode_png(bytes)?;
     let size = [rgba.width() as usize, rgba.height() as usize];
     let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-    Ok(ctx.load_texture("lorian_tool_logo", pixels, egui::TextureOptions::LINEAR))
+    Ok(ctx.load_texture(name, pixels, egui::TextureOptions::LINEAR))
 }
 
 fn card_frame(ui: &egui::Ui) -> egui::Frame {
@@ -901,10 +939,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_lorian_tool_logo_decodes() -> Result<()> {
-        let texture = load_logo_texture(&egui::Context::default())?;
-        let [width, height] = texture.size();
-        assert!(width > 0 && height > 0);
+    fn embedded_logos_decode() -> Result<()> {
+        let ctx = egui::Context::default();
+        for (name, bytes) in [("lorian", LORIAN_TOOL_LOGO), ("app", APP_LOGO)] {
+            let [width, height] = load_logo_texture(&ctx, name, bytes)?.size();
+            assert!(width > 0 && height > 0, "{name}");
+        }
         Ok(())
     }
 }

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="BindLink">
+  <rect x="6" y="6" width="32" height="32" rx="7" fill="none" stroke="#4c9162" stroke-width="7"/>
+  <rect x="26" y="26" width="32" height="32" rx="7" fill="none" stroke="#2f3b45" stroke-width="7"/>
+  <path d="M38 21 V31" stroke="#4c9162" stroke-width="7" stroke-linecap="butt"/>
+  <rect x="15" y="15" width="10" height="4" rx="2" fill="#4c9162"/>
+  <rect x="39" y="45" width="10" height="4" rx="2" fill="#2f3b45"/>
+</svg>
