@@ -121,6 +121,24 @@
 - Junction 对游戏透明：链接后新截图直接写入共享目录，所有链接到同一共享目录的实例在游戏内画廊中都能看到；在任一实例中删除截图会同时影响其他实例。
 - 界面默认处理方式为"Junction 指向共享目录"。
 
+### 2.10 共享目录结构
+- 默认位置为模板实例所属 `.minecraft` 下的 `bindlink-shared`，与实例同盘，首次共享时移动只需改名；目录在迁移确实用到时才由各同步步骤创建。用户可在界面中改选其他目录，或恢复默认；手动选择不跨次保存。
+- Voxy、Bobby、材质包、Axiom 蓝图与截图共用同一个共享目录，按种类分子目录：
+
+  ```
+  bindlink-shared\
+  ├─ voxy\<服务器地址>\
+  ├─ bobby\<服务器地址>\
+  ├─ resourcepacks\
+  ├─ resourcepacks.bak\
+  ├─ axiom-blueprints\
+  ├─ axiom-blueprints.bak\
+  ├─ screenshots\
+  └─ screenshots.bak\
+  ```
+
+  `.bak` 子目录只在同名冲突选择"使用新版本"时出现。
+
 ---
 
 ## 3. 技术栈与模块设计
@@ -140,7 +158,7 @@
 - `src/types.rs`: 全局公用枚举与数据结构定义。
 
 ### 核心数据结构
-- `DetectedInstance` 包含 `launcher: LauncherKind` 字段，`LauncherKind` 取值为 `Pcl2 / Unknown`，定义在 `src/types.rs`。
+- `DetectedInstance` 包含 `minecraft_root`（所属 `.minecraft` 根目录，决定默认共享目录位置）与 `launcher: LauncherKind` 字段，`LauncherKind` 取值为 `Pcl2 / Unknown`，定义在 `src/types.rs`。
 - `ServerCache`（`Voxy / Bobby`）标识缓存种类，`CacheTransfer`（`Copy / LinkToSource / LinkToShared(共享目录)`）表示迁移方式；`MigrationRequest` 的 `voxy`、`bobby` 字段各为 `Option<CacheTransfer>`，`None` 表示不处理。
 - `SharedAsset`（`ResourcePacks / AxiomBlueprints / Screenshots`）标识资源种类；`PackTransfer`（`CopyMissing / LinkToShared(共享目录)`）表示处理方式，对应 `MigrationRequest.resource_packs`、`MigrationRequest.axiom_blueprints` 与 `MigrationRequest.screenshots`；同名冲突以 `PackConflict`（种类、名称、`existing` 与 `incoming` 两个 `PackVersion`：来源、大小、修改时间、蓝图数据版本）交给界面，用户返回 `ConflictChoice`（`KeepExisting / UseIncoming`）。后台线程通过消息把冲突发给界面并阻塞等待回复。
 - 业务模块通过 `LogSink` 输出 `LogEntry`（`LogLevel`：`Info / Skip / Success / Warning / Error`），界面据此着色：跳过的操作用 `Skip`，已写入、复制或链接用 `Success`，单个条目失败用 `Warning`，整个步骤失败用 `Error`。
