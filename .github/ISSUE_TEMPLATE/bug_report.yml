@@ -1,0 +1,63 @@
+name: 问题反馈
+description: 迁移失败、结果不对或程序报错
+title: "[问题] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: 提交前请先阅读 README 中的"使用前请注意"与"限制"，确认迁移时所有 Minecraft 实例都已关闭。
+  - type: input
+    id: version
+    attributes:
+      label: BindLink 版本
+      description: 窗口标题中显示的版本号
+      placeholder: v1.0.0+0103
+    validations:
+      required: true
+  - type: input
+    id: mc-versions
+    attributes:
+      label: 模板实例与目标实例的游戏版本
+      description: 包括加载器，例如 Fabric、NeoForge
+      placeholder: 模板 26.2 Fabric，目标 26.3 Fabric
+    validations:
+      required: true
+  - type: dropdown
+    id: launcher
+    attributes:
+      label: 启动器
+      options:
+        - PCL2
+        - 其他
+    validations:
+      required: true
+  - type: checkboxes
+    id: items
+    attributes:
+      label: 本次勾选的同步内容
+      options:
+        - label: 按键与选项（options.txt）
+        - label: Mod 独立配置
+        - label: 地图与路点
+        - label: Voxy / Bobby 缓存
+        - label: 材质包 / Axiom 蓝图
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 操作步骤、期望结果和实际结果
+      placeholder: |
+        1. 选择模板实例 A、目标实例 B，同步模式为局部合并
+        2. 点击开始迁移
+        期望：……
+        实际：……
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: 日志
+      description: 复制右侧日志区的内容，警告与失败的行最重要
+      render: text
+    validations:
+      required: true
