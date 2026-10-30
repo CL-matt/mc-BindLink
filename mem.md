@@ -91,7 +91,7 @@
   | 洛林 | 局部合并 | 物理复制 |
   | neko喵喵喵 | 全量覆写 | Junction 指向共享目录（共享目录仍需用户选择） |
 
-- 固定配置不修改材质包的处理方式；Axiom 蓝图的处理方式统一设为"不处理"。
+- 固定配置不修改材质包的处理方式；Axiom 蓝图的处理方式统一设为"不处理"；截图统一设为"Junction 指向共享目录"。
 
 ### 2.7 材质包同步 (`pack_sync.rs`)
 - 目录：实例的 `resourcepacks/`，其中每个 `.zip` 文件或文件夹为一个材质包。光影包（`shaderpacks/`）不同步。
@@ -115,6 +115,12 @@
   - 同名冲突弹窗额外显示双方蓝图的数据版本号。
 - 排序文件：不参与冲突处理。复制或并入完成后，把新放入的蓝图名追加到目的目录（复制模式为目标实例，共享模式为共享目录）排序文件的末尾，已记录的名称不重复追加；追加顺序跟随模板排序文件，模板未记录的按名称排序。写入前按 §4 备份。
 
+### 2.9 截图同步 (`pack_sync.rs`)
+- 目录（已在 PCL 实例中实测）：`screenshots/`，原版与 Better Screenshots（Modrinth `better-mc-screenshots`）都直接读写该目录，Better Screenshots 配置中没有自定义截图路径的选项。只处理目录下的文件。
+- 复制、共享、同名冲突与备份规则与 §2.7 相同；共享目录为 `<共享目录>\screenshots`，复制模式备份到 `screenshots.bak/`，共享模式备份到 `<共享目录>\screenshots.bak\`，共享时目标原有的剩余文件整体重命名为 `screenshots.<unix秒>.bak`。
+- Junction 对游戏透明：链接后新截图直接写入共享目录，所有链接到同一共享目录的实例在游戏内画廊中都能看到；在任一实例中删除截图会同时影响其他实例。
+- 界面默认处理方式为"Junction 指向共享目录"。
+
 ---
 
 ## 3. 技术栈与模块设计
@@ -136,7 +142,7 @@
 ### 核心数据结构
 - `DetectedInstance` 包含 `launcher: LauncherKind` 字段，`LauncherKind` 取值为 `Pcl2 / Unknown`，定义在 `src/types.rs`。
 - `ServerCache`（`Voxy / Bobby`）标识缓存种类，`CacheTransfer`（`Copy / LinkToSource / LinkToShared(共享目录)`）表示迁移方式；`MigrationRequest` 的 `voxy`、`bobby` 字段各为 `Option<CacheTransfer>`，`None` 表示不处理。
-- `SharedAsset`（`ResourcePacks / AxiomBlueprints`）标识资源种类；`PackTransfer`（`CopyMissing / LinkToShared(共享目录)`）表示处理方式，对应 `MigrationRequest.resource_packs` 与 `MigrationRequest.axiom_blueprints`；同名冲突以 `PackConflict`（种类、名称、`existing` 与 `incoming` 两个 `PackVersion`：来源、大小、修改时间、蓝图数据版本）交给界面，用户返回 `ConflictChoice`（`KeepExisting / UseIncoming`）。后台线程通过消息把冲突发给界面并阻塞等待回复。
+- `SharedAsset`（`ResourcePacks / AxiomBlueprints / Screenshots`）标识资源种类；`PackTransfer`（`CopyMissing / LinkToShared(共享目录)`）表示处理方式，对应 `MigrationRequest.resource_packs`、`MigrationRequest.axiom_blueprints` 与 `MigrationRequest.screenshots`；同名冲突以 `PackConflict`（种类、名称、`existing` 与 `incoming` 两个 `PackVersion`：来源、大小、修改时间、蓝图数据版本）交给界面，用户返回 `ConflictChoice`（`KeepExisting / UseIncoming`）。后台线程通过消息把冲突发给界面并阻塞等待回复。
 - 业务模块通过 `LogSink` 输出 `LogEntry`（`LogLevel`：`Info / Skip / Success / Warning / Error`），界面据此着色：跳过的操作用 `Skip`，已写入、复制或链接用 `Success`，单个条目失败用 `Warning`，整个步骤失败用 `Error`。
 - `src/test_support.rs` 仅在测试编译时引入，提供测试用临时目录。
 
@@ -152,6 +158,6 @@
   - 目标旁不存在 `<文件>.bak` 时生成该文件，作为最早的原始备份永不覆盖。
   - 已存在 `<文件>.bak` 时生成 `<文件>.<unix秒>.bak`，同一文件仅保留最近 5 份带时间戳的备份。
   - 时间戳使用标准库 `std::time::SystemTime` 生成，不引入 `chrono`。
-  - 例外：地图与路点目录（§2.5）文件数量大，豁免逐文件 `.bak` 备份；同步前必须在日志中列出将被覆盖的文件。Voxy 与 Bobby 缓存目录按 §2.5 整目录重命名备份；材质包与 Axiom 蓝图按 §2.7、§2.8 移入同级 `.bak` 目录或整体重命名备份。
+  - 例外：地图与路点目录（§2.5）文件数量大，豁免逐文件 `.bak` 备份；同步前必须在日志中列出将被覆盖的文件。Voxy 与 Bobby 缓存目录按 §2.5 整目录重命名备份；材质包、Axiom 蓝图与截图按 §2.7、§2.8、§2.9 移入同级 `.bak` 目录或整体重命名备份。
 - **容错防崩**：遇到破损的 `.jar`、格式不规范的 JSON/TOML 时跳过并记录日志，不得触发 `panic!`。
 - **无黑框分发**：发布模式需开启 `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`。
