@@ -576,6 +576,7 @@ mod tests {
         DetectedInstance {
             name: name.to_string(),
             game_dir: dir.path().to_path_buf(),
+            minecraft_root: dir.path().to_path_buf(),
             launcher: LauncherKind::Pcl2,
             is_isolated: true,
         }

@@ -40,6 +40,8 @@ const APP_NAME: &str = "BindLink 键链";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEADER_ICON_SIZE: f32 = 18.0;
 const HEADER_LOGO_SIZE: f32 = 28.0;
+/// 默认共享目录建在模板实例的 `.minecraft` 下，与实例同盘，首次共享时移动缓存只需改名。
+const DEFAULT_SHARED_DIR_NAME: &str = "bindlink-shared";
 
 fn main() -> eframe::Result {
     // run_native 的应用名还用作 eframe 的设置存储标识，版本号只放在窗口标题中，避免升级后丢失窗口布局
@@ -207,6 +209,7 @@ struct MigratorApp {
     pack_choice: PackChoice,
     blueprint_choice: PackChoice,
     screenshot_choice: PackChoice,
+    /// 用户手动选择的共享目录，为 `None` 时使用模板实例的默认共享目录。
     shared_dir: Option<PathBuf>,
     logs: Vec<LogEntry>,
     status: RunStatus,
@@ -309,6 +312,18 @@ impl MigratorApp {
             .contains(&PackChoice::LinkToShared)
     }
 
+    fn default_shared_dir(&self) -> Option<PathBuf> {
+        self.selected_instance(self.template_index)
+            .map(|template| template.minecraft_root.join(DEFAULT_SHARED_DIR_NAME))
+    }
+
+    /// 本次迁移实际使用的共享目录；目录不存在时由各同步步骤在用到时创建。
+    fn effective_shared_dir(&self) -> Option<PathBuf> {
+        self.shared_dir
+            .clone()
+            .or_else(|| self.default_shared_dir())
+    }
+
     fn build_request(&self) -> Result<MigrationRequest, String> {
         let template = self
             .selected_instance(self.template_index)
@@ -319,11 +334,12 @@ impl MigratorApp {
         if template.game_dir == target.game_dir {
             return Err("模板实例与目标实例不能相同".to_string());
         }
-        let voxy = self.voxy_choice.to_transfer(&self.shared_dir)?;
-        let bobby = self.bobby_choice.to_transfer(&self.shared_dir)?;
-        let resource_packs = self.pack_choice.to_transfer(&self.shared_dir)?;
-        let axiom_blueprints = self.blueprint_choice.to_transfer(&self.shared_dir)?;
-        let screenshots = self.screenshot_choice.to_transfer(&self.shared_dir)?;
+        let shared_dir = self.effective_shared_dir();
+        let voxy = self.voxy_choice.to_transfer(&shared_dir)?;
+        let bobby = self.bobby_choice.to_transfer(&shared_dir)?;
+        let resource_packs = self.pack_choice.to_transfer(&shared_dir)?;
+        let axiom_blueprints = self.blueprint_choice.to_transfer(&shared_dir)?;
+        let screenshots = self.screenshot_choice.to_transfer(&shared_dir)?;
         if !self.sync_options
             && !self.sync_mod_configs
             && !self.sync_maps
@@ -562,18 +578,31 @@ impl MigratorApp {
 
         if self.needs_shared_dir() {
             section(ui, "共享目录", |ui| {
-                match &self.shared_dir {
-                    Some(dir) => ui.label(dir.display().to_string()),
-                    None => ui.label(
-                        RichText::new("尚未选择，使用 Junction 指向共享目录前必须先选择")
-                            .color(ui.visuals().warn_fg_color),
-                    ),
-                };
-                if ui.button("📂 选择共享目录…").clicked()
-                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.shared_dir = Some(dir);
+                match (&self.shared_dir, self.default_shared_dir()) {
+                    (Some(dir), _) => {
+                        ui.label(dir.display().to_string());
+                    }
+                    (None, Some(dir)) => {
+                        ui.label(dir.display().to_string());
+                        ui.label(RichText::new("默认位置，迁移时用到才会创建").weak().small());
+                    }
+                    (None, None) => {
+                        ui.label(
+                            RichText::new("选择模板实例后显示默认位置")
+                                .color(ui.visuals().warn_fg_color),
+                        );
+                    }
                 }
+                ui.horizontal(|ui| {
+                    if ui.button("📂 选择共享目录…").clicked()
+                        && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.shared_dir = Some(dir);
+                    }
+                    if self.shared_dir.is_some() && ui.button("恢复默认").clicked() {
+                        self.shared_dir = None;
+                    }
+                });
             });
         }
     }

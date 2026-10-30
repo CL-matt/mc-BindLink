@@ -27,6 +27,8 @@ impl fmt::Display for LauncherKind {
 pub struct DetectedInstance {
     pub name: String,
     pub game_dir: PathBuf,
+    /// 实例所属的 `.minecraft` 根目录，用于确定默认共享目录的位置。
+    pub minecraft_root: PathBuf,
     pub launcher: LauncherKind,
     pub is_isolated: bool,
 }

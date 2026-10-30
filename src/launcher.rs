@@ -80,6 +80,7 @@ fn scan_minecraft_root(root: &Path) -> Result<Vec<DetectedInstance>> {
     let mut instances = vec![DetectedInstance {
         name: format!("{owner}/{MINECRAFT_DIR_NAME}"),
         game_dir: root.to_path_buf(),
+        minecraft_root: root.to_path_buf(),
         launcher: LauncherKind::Unknown,
         is_isolated: false,
     }];
@@ -100,6 +101,7 @@ fn scan_minecraft_root(root: &Path) -> Result<Vec<DetectedInstance>> {
                 name,
                 launcher: detect_launcher_kind(&version_dir),
                 game_dir: version_dir,
+                minecraft_root: root.to_path_buf(),
                 is_isolated: true,
             });
         }
@@ -144,6 +146,7 @@ mod tests {
         fs::create_dir_all(invalid.join("mods"))?;
 
         let instances = scan_minecraft_root(&root)?;
+        assert!(instances.iter().all(|i| i.minecraft_root == root));
 
         let summary: Vec<(&str, LauncherKind, bool)> = instances
             .iter()
