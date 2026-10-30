@@ -12,7 +12,9 @@ use zip::result::ZipError;
 
 use crate::map_sync;
 use crate::pack_sync::{self, ConflictResolver};
-use crate::types::{MigrationRequest, MigrationResult, PackTransfer, ServerCache, SyncMode};
+use crate::types::{
+    MigrationRequest, MigrationResult, PackTransfer, ServerCache, SharedAsset, SyncMode,
+};
 
 const OPTIONS_FILE_NAME: &str = "options.txt";
 const KEY_PREFIX: &str = "key_";
@@ -33,6 +35,9 @@ const FULL_OVERWRITE_BLACKLIST: &[&str] = &[
 const MAX_TIMESTAMPED_BACKUPS: usize = 5;
 /// `options.txt` 中记录已启用材质包的条目。
 const ENABLED_PACK_KEYS: &[&str] = &["resourcePacks", "incompatibleResourcePacks"];
+const AXIOM_MOD_ID: &str = "axiom";
+/// Axiom 蓝图界面的排列顺序，每行一个蓝图文件名。
+const BLUEPRINT_ORDERING_FILE: &str = ".axiom_blueprint_ordering";
 
 /// 独立 Mod 配置文件的同步规则：目标实例安装了 `mod_id` 时才处理 `relative_path`。
 struct ModConfigRule {
@@ -43,7 +48,7 @@ struct ModConfigRule {
 }
 
 const MOD_CONFIG_RULES: &[ModConfigRule] = &[ModConfigRule {
-    mod_id: "axiom",
+    mod_id: AXIOM_MOD_ID,
     relative_path: "config/axiom/axiom.json",
     merge_fields: &["keybinds"],
 }];
@@ -94,20 +99,26 @@ pub fn run_migration(
         record_step_failure(&format!("{kind} 缓存迁移"), outcome, log, &mut result);
     }
     if let Some(method) = &request.resource_packs {
-        let outcome = pack_sync::sync_resource_packs(
+        let outcome = pack_sync::sync_shared_assets(
+            SharedAsset::ResourcePacks,
             &request.template,
             &request.target,
             method,
+            None,
             resolve,
             log,
         )
-        .map(|step| merge_result(&mut result, step));
+        .map(|step| merge_result(&mut result, step.result));
         record_step_failure("材质包同步", outcome, log, &mut result);
         // 只有共享目录保证两个实例拥有相同的材质包文件，启用列表才能安全照搬
         if matches!(method, PackTransfer::LinkToShared(_)) {
             let outcome = sync_enabled_pack_list(template_dir, target_dir, log, &mut result);
             record_step_failure("材质包启用列表同步", outcome, log, &mut result);
         }
+    }
+    if let Some(method) = &request.axiom_blueprints {
+        let outcome = sync_axiom_blueprints(request, method, resolve, log, &mut result);
+        record_step_failure("Axiom 蓝图同步", outcome, log, &mut result);
     }
 
     log(format!(
@@ -399,6 +410,128 @@ fn sync_enabled_pack_list(
         .with_context(|| format!("写入 {} 失败", target_path.display()))?;
     log("材质包启用列表：已按模板更新".to_string());
     result.changed_paths.push(target_path);
+    Ok(())
+}
+
+/// 同步 Axiom 蓝图并把新放入的蓝图追加到排序文件。
+///
+/// 复制模式只放入数据版本号不超过目标实例的蓝图；共享模式要求两个实例的数据版本号相同，
+/// 因为共享目录中的蓝图对所有链接的实例可见，旧版本实例加载新版本蓝图会崩溃。
+fn sync_axiom_blueprints(
+    request: &MigrationRequest,
+    method: &PackTransfer,
+    resolve: &mut ConflictResolver,
+    log: &mut dyn FnMut(String),
+    result: &mut MigrationResult,
+) -> Result<()> {
+    let template_dir = &request.template.game_dir;
+    let target_dir = &request.target.game_dir;
+    let installed = detect_installed_mod_ids(&target_dir.join("mods"), log)?;
+    if !installed.contains(AXIOM_MOD_ID) {
+        log("Axiom 蓝图：目标实例未安装 Axiom，跳过".to_string());
+        return Ok(());
+    }
+    let target_version = read_data_version(target_dir)?;
+    let max_data_version = match method {
+        PackTransfer::CopyMissing => Some(target_version.ok_or_else(|| {
+            anyhow!("目标实例的 options.txt 缺少数据版本号，无法判断蓝图能否加载，请先启动一次游戏")
+        })?),
+        PackTransfer::LinkToShared(_) => {
+            let template_version = read_data_version(template_dir)?;
+            if template_version.is_none() || template_version != target_version {
+                bail!(
+                    "共享蓝图要求两个实例的游戏数据版本相同（模板 {}，目标 {}），请改用复制模式",
+                    describe_data_version(template_version),
+                    describe_data_version(target_version)
+                );
+            }
+            None
+        }
+    };
+
+    let blueprint_dir = pack_sync::asset_dir(SharedAsset::AxiomBlueprints);
+    let template_order = read_blueprint_ordering(&template_dir.join(blueprint_dir))?;
+    let outcome = pack_sync::sync_shared_assets(
+        SharedAsset::AxiomBlueprints,
+        &request.template,
+        &request.target,
+        method,
+        max_data_version,
+        resolve,
+        log,
+    )?;
+    merge_result(result, outcome.result);
+    for (dir, names) in outcome.added {
+        append_blueprint_ordering(&dir, &names, &template_order, log, result)?;
+    }
+    Ok(())
+}
+
+fn describe_data_version(version: Option<i64>) -> String {
+    version.map_or_else(|| "未知".to_string(), |v| v.to_string())
+}
+
+/// 读取实例 `options.txt` 记录的游戏数据版本号，文件或条目不存在时返回 `None`。
+fn read_data_version(game_dir: &Path) -> Result<Option<i64>> {
+    let path = game_dir.join(OPTIONS_FILE_NAME);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(OptionsFile::load(&path)?
+        .get(VERSION_KEY)
+        .and_then(|value| value.trim().parse().ok()))
+}
+
+fn read_blueprint_ordering(dir: &Path) -> Result<Vec<String>> {
+    let path = dir.join(BLUEPRINT_ORDERING_FILE);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("读取 {} 失败", path.display()))?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// 把 `names` 中排序文件尚未记录的蓝图追加到末尾，顺序跟随模板的排序文件。
+fn append_blueprint_ordering(
+    dir: &Path,
+    names: &[String],
+    template_order: &[String],
+    log: &mut dyn FnMut(String),
+    result: &mut MigrationResult,
+) -> Result<()> {
+    let mut ordering = read_blueprint_ordering(dir)?;
+    let mut missing: Vec<&String> = names
+        .iter()
+        .filter(|name| !ordering.contains(name))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_by_key(|name| {
+        (
+            template_order
+                .iter()
+                .position(|ordered| ordered == *name)
+                .unwrap_or(usize::MAX),
+            (*name).clone(),
+        )
+    });
+    ordering.extend(missing.into_iter().cloned());
+
+    let path = dir.join(BLUEPRINT_ORDERING_FILE);
+    if let Some(backup) = backup_file_safely(&path)? {
+        log(format!("已备份到 {}", backup.display()));
+    }
+    let text: String = ordering.iter().map(|name| format!("{name}\n")).collect();
+    fs::write(&path, text).with_context(|| format!("写入 {} 失败", path.display()))?;
+    log(format!("Axiom 蓝图：已更新排序文件 {}", path.display()));
+    result.changed_paths.push(path);
     Ok(())
 }
 
@@ -838,6 +971,30 @@ mod tests {
             &destination,
             SyncMode::Merge
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn blueprint_ordering_appends_new_names_in_template_order() -> Result<()> {
+        let dir = TempDir::new("bp-ordering")?;
+        fs::write(dir.path().join(BLUEPRINT_ORDERING_FILE), "mine.bp\n")?;
+        let names = ["b.bp", "a.bp", "mine.bp", "z.bp"].map(String::from);
+        let template_order = ["a.bp", "b.bp"].map(String::from);
+
+        let mut result = MigrationResult::default();
+        append_blueprint_ordering(
+            dir.path(),
+            &names,
+            &template_order,
+            &mut no_log(),
+            &mut result,
+        )?;
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join(BLUEPRINT_ORDERING_FILE))?,
+            "mine.bp\na.bp\nb.bp\nz.bp\n"
+        );
+        assert!(dir.path().join(".axiom_blueprint_ordering.bak").is_file());
         Ok(())
     }
 

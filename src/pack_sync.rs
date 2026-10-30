@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use flate2::read::GzDecoder;
 use walkdir::WalkDir;
 
 use crate::map_sync::{
@@ -12,145 +13,230 @@ use crate::map_sync::{
 };
 use crate::types::{
     ConflictChoice, DetectedInstance, MigrationResult, PackConflict, PackTransfer, PackVersion,
+    SharedAsset,
 };
 
-const RESOURCE_PACKS_DIR: &str = "resourcepacks";
-/// 被替换下来的材质包放在材质包目录之外，避免游戏把备份当作可选材质包列出。
-const PACK_BACKUP_DIR: &str = "resourcepacks.bak";
 const SHARED_OWNER: &str = "共享目录";
+const BLUEPRINT_EXTENSION: &str = "bp";
+const BLUEPRINT_MAGIC: [u8; 4] = [0x0a, 0xe5, 0xbb, 0x36];
+/// NBT 中 `DataVersion` 整数标签的类型字节、名称长度与名称。
+const DATA_VERSION_TAG: &[u8] = b"\x03\x00\x0bDataVersion";
 
 /// 把一批同名冲突交给用户决定，返回与输入一一对应的选择。
 pub type ConflictResolver<'a> = dyn FnMut(Vec<PackConflict>) -> Result<Vec<ConflictChoice>> + 'a;
 
-/// 按 `method` 同步模板与目标实例的材质包，同名且内容不同的材质包由 `resolve` 交给用户决定。
-pub fn sync_resource_packs(
-    template: &DetectedInstance,
-    target: &DetectedInstance,
-    method: &PackTransfer,
-    resolve: &mut ConflictResolver,
-    log: &mut dyn FnMut(String),
-) -> Result<MigrationResult> {
-    match method {
-        PackTransfer::CopyMissing => copy_missing_packs(template, target, resolve, log),
-        PackTransfer::LinkToShared(shared_root) => {
-            link_packs_to_shared(template, target, shared_root, resolve, log)
+/// 资源同步结果，`added` 记录每个目录新放入的条目名称，供调用方更新 Axiom 蓝图排序文件。
+#[derive(Debug, Default)]
+pub struct AssetSyncOutcome {
+    pub result: MigrationResult,
+    pub added: Vec<(PathBuf, Vec<String>)>,
+}
+
+/// 资源在游戏目录中的相对位置。
+pub fn asset_dir(kind: SharedAsset) -> &'static str {
+    match kind {
+        SharedAsset::ResourcePacks => "resourcepacks",
+        SharedAsset::AxiomBlueprints => "config/axiom/blueprints",
+    }
+}
+
+fn shared_subdir(kind: SharedAsset) -> &'static str {
+    match kind {
+        SharedAsset::ResourcePacks => "resourcepacks",
+        SharedAsset::AxiomBlueprints => "axiom-blueprints",
+    }
+}
+
+/// 材质包目录中的每个文件或文件夹都是一个材质包；蓝图目录只处理 `.bp` 文件，排序文件由调用方单独合并。
+fn is_asset_entry(kind: SharedAsset, path: &Path) -> bool {
+    match kind {
+        SharedAsset::ResourcePacks => true,
+        SharedAsset::AxiomBlueprints => {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(BLUEPRINT_EXTENSION))
         }
     }
 }
 
-fn copy_missing_packs(
+/// 按 `method` 同步模板与目标实例的 `kind` 资源，同名且内容不同的条目由 `resolve` 交给用户决定。
+///
+/// `max_data_version` 不为空时，复制模式只放入数据版本号不超过该值的蓝图，避免目标版本加载新版本蓝图时崩溃。
+pub fn sync_shared_assets(
+    kind: SharedAsset,
     template: &DetectedInstance,
     target: &DetectedInstance,
+    method: &PackTransfer,
+    max_data_version: Option<i64>,
     resolve: &mut ConflictResolver,
     log: &mut dyn FnMut(String),
-) -> Result<MigrationResult> {
-    let mut result = MigrationResult::default();
-    let source_dir = template.game_dir.join(RESOURCE_PACKS_DIR);
-    if !source_dir.is_dir() {
-        log("材质包：模板实例没有 resourcepacks 目录，跳过".to_string());
-        return Ok(result);
+) -> Result<AssetSyncOutcome> {
+    match method {
+        PackTransfer::CopyMissing => {
+            copy_missing_assets(kind, template, target, max_data_version, resolve, log)
+        }
+        PackTransfer::LinkToShared(shared_root) => {
+            link_assets_to_shared(kind, template, target, shared_root, resolve, log)
+        }
     }
-    let target_dir = target.game_dir.join(RESOURCE_PACKS_DIR);
+}
+
+fn copy_missing_assets(
+    kind: SharedAsset,
+    template: &DetectedInstance,
+    target: &DetectedInstance,
+    max_data_version: Option<i64>,
+    resolve: &mut ConflictResolver,
+    log: &mut dyn FnMut(String),
+) -> Result<AssetSyncOutcome> {
+    let mut outcome = AssetSyncOutcome::default();
+    let source_dir = template.game_dir.join(asset_dir(kind));
+    if !source_dir.is_dir() {
+        log(format!("{kind}：模板实例没有 {}，跳过", asset_dir(kind)));
+        return Ok(outcome);
+    }
+    let target_dir = target.game_dir.join(asset_dir(kind));
     fs::create_dir_all(&target_dir)
         .with_context(|| format!("创建目录 {} 失败", target_dir.display()))?;
 
     let mut missing = Vec::new();
     let mut conflicts = Vec::new();
-    for (name, source) in list_packs(&source_dir)? {
+    for (name, source) in list_assets(kind, &source_dir)? {
         let destination = target_dir.join(&name);
-        if !destination.exists() {
-            missing.push((source, destination));
-        } else if !have_same_content(&source, &destination)? {
+        let differs = destination.exists() && !have_same_content(&source, &destination)?;
+        if destination.exists() && !differs {
+            continue;
+        }
+        if let Some(max) = max_data_version
+            && let Some(reason) = check_blueprint_version(&source, max)
+        {
+            log(format!("{kind}：跳过 {name}，{reason}"));
+            continue;
+        }
+        if differs {
             conflicts.push(PlannedConflict {
                 name,
                 incoming: source,
                 existing: destination,
             });
+        } else {
+            missing.push((name, source, destination));
         }
     }
-    let choices = ask_user(&conflicts, &target.name, &template.name, resolve)?;
+    let choices = ask_user(kind, &conflicts, &target.name, &template.name, resolve)?;
 
-    for (source, destination) in missing {
-        copy_pack(&source, &destination)?;
-        result.changed_paths.push(destination);
+    let mut added = Vec::new();
+    for (name, source, destination) in missing {
+        copy_entry(&source, &destination)?;
+        outcome.result.changed_paths.push(destination);
+        added.push(name);
     }
+    let backup_dir = target_dir.with_file_name(format!("{}.bak", file_name_of(&target_dir)));
     for (conflict, choice) in conflicts.into_iter().zip(choices) {
         if choice == ConflictChoice::KeepExisting {
             continue;
         }
         ensure_cache_not_in_use(&conflict.existing)?;
-        let backup = move_to_backup(&conflict.existing, &target.game_dir)?;
-        copy_pack(&conflict.incoming, &conflict.existing)?;
+        let backup = move_to_backup(&conflict.existing, &backup_dir)?;
+        copy_entry(&conflict.incoming, &conflict.existing)?;
         log(format!(
-            "材质包：{} 已替换为模板版本，原版本移至 {}",
+            "{kind}：{} 已替换为模板版本，原版本移至 {}",
             conflict.name,
             backup.display()
         ));
-        result.changed_paths.push(conflict.existing);
+        outcome.result.changed_paths.push(conflict.existing);
     }
     log(format!(
-        "材质包：复制或替换 {} 个",
-        result.changed_paths.len()
+        "{kind}：复制或替换 {} 个",
+        outcome.result.changed_paths.len()
     ));
-    Ok(result)
+    outcome.added.push((target_dir, added));
+    Ok(outcome)
 }
 
-fn link_packs_to_shared(
+/// 蓝图比目标版本新或无法读取版本时返回跳过原因。
+fn check_blueprint_version(path: &Path, max: i64) -> Option<String> {
+    match read_blueprint_data_version(path) {
+        Ok(version) if version <= max => None,
+        Ok(version) => Some(format!(
+            "数据版本 {version} 高于目标实例的 {max}，放入后游戏会无法加载"
+        )),
+        Err(err) => Some(format!("无法读取数据版本：{err:#}")),
+    }
+}
+
+fn link_assets_to_shared(
+    kind: SharedAsset,
     template: &DetectedInstance,
     target: &DetectedInstance,
     shared_root: &Path,
     resolve: &mut ConflictResolver,
     log: &mut dyn FnMut(String),
-) -> Result<MigrationResult> {
-    let mut result = MigrationResult::default();
-    let shared = shared_root.join(RESOURCE_PACKS_DIR);
-    // 先处理模板，使共享目录第一次创建时以模板的材质包为准
+) -> Result<AssetSyncOutcome> {
+    let mut outcome = AssetSyncOutcome::default();
+    let shared = shared_root.join(shared_subdir(kind));
+    // 先处理模板，使共享目录第一次创建时以模板的内容为准
     for instance in [template, target] {
-        if link_instance_packs(instance, &shared, shared_root, resolve, log)? {
-            result
+        let linked = link_instance_assets(kind, instance, &shared, shared_root, resolve, log)?;
+        if let Some(added) = linked {
+            outcome
+                .result
                 .changed_paths
-                .push(instance.game_dir.join(RESOURCE_PACKS_DIR));
+                .push(instance.game_dir.join(asset_dir(kind)));
+            outcome.added.push((shared.clone(), added));
         }
     }
-    Ok(result)
+    Ok(outcome)
 }
 
-/// 把实例的材质包并入共享目录后建立链接，实例已链接到共享目录时返回 `false`。
-fn link_instance_packs(
+/// 把实例的资源并入共享目录后建立链接，返回新并入共享目录的条目名称；实例已链接到共享目录时返回 `None`。
+fn link_instance_assets(
+    kind: SharedAsset,
     instance: &DetectedInstance,
     shared: &Path,
     shared_root: &Path,
     resolve: &mut ConflictResolver,
     log: &mut dyn FnMut(String),
-) -> Result<bool> {
-    let packs_dir = instance.game_dir.join(RESOURCE_PACKS_DIR);
-    if packs_dir.exists()
+) -> Result<Option<Vec<String>>> {
+    let instance_dir = instance.game_dir.join(asset_dir(kind));
+    if instance_dir.exists()
         && shared.exists()
-        && resolve_real_path(&packs_dir)? == resolve_real_path(shared)?
+        && resolve_real_path(&instance_dir)? == resolve_real_path(shared)?
     {
-        log(format!("材质包：{} 已链接到共享目录，跳过", instance.name));
-        return Ok(false);
+        log(format!("{kind}：{} 已链接到共享目录，跳过", instance.name));
+        return Ok(None);
     }
 
-    if packs_dir.exists() {
-        // 实例的材质包目录若已链接到别处，合并会改动其他实例正在使用的目录
-        if is_link(&packs_dir)? {
+    let mut added = Vec::new();
+    if instance_dir.exists() {
+        // 实例目录若已链接到别处，合并会改动其他实例正在使用的目录
+        if is_link(&instance_dir)? {
             bail!(
-                "{} 的 resourcepacks 是指向 {} 的链接，无法合并到共享目录",
+                "{} 的 {} 是指向 {} 的链接，无法合并到共享目录",
                 instance.name,
-                resolve_real_path(&packs_dir)?.display()
+                asset_dir(kind),
+                resolve_real_path(&instance_dir)?.display()
             );
         }
-        ensure_cache_not_in_use(&packs_dir)?;
+        ensure_cache_not_in_use(&instance_dir)?;
         if shared.exists() {
-            merge_into_shared(instance, &packs_dir, shared, shared_root, resolve, log)?;
-            set_aside_leftovers(&packs_dir, log)?;
+            added = merge_into_shared(
+                kind,
+                instance,
+                &instance_dir,
+                shared,
+                shared_root,
+                resolve,
+                log,
+            )?;
+            set_aside_leftovers(kind, &instance_dir, log)?;
         } else {
             fs::create_dir_all(shared_root)
                 .with_context(|| format!("创建目录 {} 失败", shared_root.display()))?;
-            move_dir(&packs_dir, shared)?;
+            move_dir(&instance_dir, shared)?;
             log(format!(
-                "材质包：已将 {} 的材质包移动到 {}",
+                "{kind}：已将 {} 的内容移动到 {}",
                 instance.name,
                 shared.display()
             ));
@@ -158,37 +244,42 @@ fn link_instance_packs(
     } else {
         fs::create_dir_all(shared)
             .with_context(|| format!("创建目录 {} 失败", shared.display()))?;
+        if let Some(parent) = instance_dir.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("创建目录 {} 失败", parent.display()))?;
+        }
     }
 
-    create_junction(&packs_dir, shared).with_context(|| {
+    create_junction(&instance_dir, shared).with_context(|| {
         format!(
-            "材质包已位于 {}，但 {} 的链接建立失败",
+            "{kind}已位于 {}，但 {} 的链接建立失败",
             shared.display(),
             instance.name
         )
     })?;
     log(format!(
-        "材质包：{} → {}",
-        packs_dir.display(),
+        "{kind}：{} → {}",
+        instance_dir.display(),
         shared.display()
     ));
-    Ok(true)
+    Ok(Some(added))
 }
 
 fn merge_into_shared(
+    kind: SharedAsset,
     instance: &DetectedInstance,
-    packs_dir: &Path,
+    instance_dir: &Path,
     shared: &Path,
     shared_root: &Path,
     resolve: &mut ConflictResolver,
     log: &mut dyn FnMut(String),
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let mut moves = Vec::new();
     let mut conflicts = Vec::new();
-    for (name, path) in list_packs(packs_dir)? {
+    for (name, path) in list_assets(kind, instance_dir)? {
         let destination = shared.join(&name);
         if !destination.exists() {
-            moves.push((path, destination));
+            moves.push((name, path, destination));
         } else if !have_same_content(&path, &destination)? {
             conflicts.push(PlannedConflict {
                 name,
@@ -197,46 +288,53 @@ fn merge_into_shared(
             });
         }
     }
-    let choices = ask_user(&conflicts, SHARED_OWNER, &instance.name, resolve)?;
+    let choices = ask_user(kind, &conflicts, SHARED_OWNER, &instance.name, resolve)?;
 
-    let moved = moves.len();
-    for (path, destination) in moves {
+    let mut added = Vec::new();
+    for (name, path, destination) in moves {
         move_dir(&path, &destination)?;
+        added.push(name);
     }
+    let backup_dir = shared_root.join(format!("{}.bak", shared_subdir(kind)));
     for (conflict, choice) in conflicts.into_iter().zip(choices) {
         if choice == ConflictChoice::KeepExisting {
             continue;
         }
         ensure_cache_not_in_use(&conflict.existing)?;
-        let backup = move_to_backup(&conflict.existing, shared_root)?;
+        let backup = move_to_backup(&conflict.existing, &backup_dir)?;
         move_dir(&conflict.incoming, &conflict.existing)?;
         log(format!(
-            "材质包：共享目录中的 {} 已替换为 {} 的版本，原版本移至 {}",
+            "{kind}：共享目录中的 {} 已替换为 {} 的版本，原版本移至 {}",
             conflict.name,
             instance.name,
             backup.display()
         ));
     }
     log(format!(
-        "材质包：已将 {} 的 {moved} 个材质包并入共享目录",
-        instance.name
+        "{kind}：已将 {} 的 {} 个条目并入共享目录",
+        instance.name,
+        added.len()
     ));
-    Ok(())
+    Ok(added)
 }
 
-/// 合并后实例目录中剩下的是与共享目录相同或用户选择保留共享版本的材质包，整体改名保留。
-fn set_aside_leftovers(packs_dir: &Path, log: &mut dyn FnMut(String)) -> Result<()> {
-    let is_empty = fs::read_dir(packs_dir)
-        .with_context(|| format!("读取目录 {} 失败", packs_dir.display()))?
+/// 合并后实例目录中剩下的是与共享目录相同、用户选择保留共享版本或不属于资源条目的文件，整体改名保留。
+fn set_aside_leftovers(
+    kind: SharedAsset,
+    instance_dir: &Path,
+    log: &mut dyn FnMut(String),
+) -> Result<()> {
+    let is_empty = fs::read_dir(instance_dir)
+        .with_context(|| format!("读取目录 {} 失败", instance_dir.display()))?
         .next()
         .is_none();
     if is_empty {
-        fs::remove_dir(packs_dir)
-            .with_context(|| format!("删除空目录 {} 失败", packs_dir.display()))?;
+        fs::remove_dir(instance_dir)
+            .with_context(|| format!("删除空目录 {} 失败", instance_dir.display()))?;
     } else {
-        let backup = rename_aside(packs_dir)?;
+        let backup = rename_aside(instance_dir)?;
         log(format!(
-            "材质包：未并入的原有材质包保留在 {}",
+            "{kind}：未并入的原有文件保留在 {}",
             backup.display()
         ));
     }
@@ -250,6 +348,7 @@ struct PlannedConflict {
 }
 
 fn ask_user(
+    kind: SharedAsset,
     conflicts: &[PlannedConflict],
     existing_owner: &str,
     incoming_owner: &str,
@@ -261,9 +360,10 @@ fn ask_user(
     let mut questions = Vec::new();
     for conflict in conflicts {
         questions.push(PackConflict {
+            kind,
             pack_name: conflict.name.clone(),
-            existing: describe_pack(&conflict.existing, existing_owner)?,
-            incoming: describe_pack(&conflict.incoming, incoming_owner)?,
+            existing: describe_entry(kind, &conflict.existing, existing_owner)?,
+            incoming: describe_entry(kind, &conflict.incoming, incoming_owner)?,
         });
     }
     let choices = resolve(questions)?;
@@ -277,7 +377,7 @@ fn ask_user(
     Ok(choices)
 }
 
-fn describe_pack(path: &Path, owner: &str) -> Result<PackVersion> {
+fn describe_entry(kind: SharedAsset, path: &Path, owner: &str) -> Result<PackVersion> {
     let metadata =
         fs::metadata(path).with_context(|| format!("读取 {} 的属性失败", path.display()))?;
     let size = if metadata.is_dir() {
@@ -295,28 +395,78 @@ fn describe_pack(path: &Path, owner: &str) -> Result<PackVersion> {
     } else {
         metadata.len()
     };
+    // 版本号只用于帮助用户比较，读取失败时显示为未知
+    let data_version = match kind {
+        SharedAsset::ResourcePacks => None,
+        SharedAsset::AxiomBlueprints => read_blueprint_data_version(path).ok(),
+    };
     Ok(PackVersion {
         owner: owner.to_string(),
         size,
         modified: metadata.modified().ok(),
+        data_version,
     })
 }
 
-fn list_packs(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let mut packs = Vec::new();
+/// 读取 Axiom 蓝图中方块数据记录的游戏数据版本号。
+///
+/// 蓝图文件依次为：4 字节魔数、长度前缀的头部 NBT、长度前缀的缩略图、长度前缀的 gzip 方块数据 NBT；
+/// 头部的 `Version` 是 Axiom 自身的格式版本，游戏数据版本只记录在方块数据中。
+pub fn read_blueprint_data_version(path: &Path) -> Result<i64> {
+    let bytes = fs::read(path).with_context(|| format!("读取 {} 失败", path.display()))?;
+    if !bytes.starts_with(&BLUEPRINT_MAGIC) {
+        bail!("不是 Axiom 蓝图文件");
+    }
+    let mut offset = BLUEPRINT_MAGIC.len();
+    for section in ["头部", "缩略图"] {
+        let length = read_section_length(&bytes, offset, section)?;
+        offset += 4 + length;
+    }
+    let length = read_section_length(&bytes, offset, "方块数据")?;
+    let block_data = bytes
+        .get(offset + 4..offset + 4 + length)
+        .context("方块数据长度超出文件范围")?;
+    let mut nbt = Vec::new();
+    GzDecoder::new(block_data)
+        .read_to_end(&mut nbt)
+        .context("方块数据解压失败")?;
+    let position = nbt
+        .windows(DATA_VERSION_TAG.len())
+        .position(|window| window == DATA_VERSION_TAG)
+        .context("方块数据中没有 DataVersion")?;
+    let value_start = position + DATA_VERSION_TAG.len();
+    let value: [u8; 4] = nbt
+        .get(value_start..value_start + 4)
+        .and_then(|slice| slice.try_into().ok())
+        .context("DataVersion 数据不完整")?;
+    Ok(i64::from(i32::from_be_bytes(value)))
+}
+
+fn read_section_length(bytes: &[u8], offset: usize, section: &str) -> Result<usize> {
+    let raw: [u8; 4] = bytes
+        .get(offset..offset + 4)
+        .and_then(|slice| slice.try_into().ok())
+        .with_context(|| format!("{section}长度字段不完整"))?;
+    Ok(u32::from_be_bytes(raw) as usize)
+}
+
+fn list_assets(kind: SharedAsset, dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut entries = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("读取目录 {} 失败", dir.display()))?
     {
         let entry = entry.with_context(|| format!("读取目录 {} 失败", dir.display()))?;
-        packs.push((
-            entry.file_name().to_string_lossy().into_owned(),
-            entry.path(),
-        ));
+        if is_asset_entry(kind, &entry.path()) {
+            entries.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            ));
+        }
     }
-    packs.sort();
-    Ok(packs)
+    entries.sort();
+    Ok(entries)
 }
 
-fn copy_pack(source: &Path, destination: &Path) -> Result<()> {
+fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
     if source.is_dir() {
         copy_dir_recursive(source, destination)
     } else {
@@ -330,19 +480,20 @@ fn copy_pack(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
-fn move_to_backup(path: &Path, backup_parent: &Path) -> Result<PathBuf> {
-    let backup_dir = backup_parent.join(PACK_BACKUP_DIR);
-    fs::create_dir_all(&backup_dir)
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn move_to_backup(path: &Path, backup_dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(backup_dir)
         .with_context(|| format!("创建目录 {} 失败", backup_dir.display()))?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("系统时间早于 1970 年")?
         .as_secs();
-    let backup = backup_dir.join(format!("{name}.{seconds}"));
+    let backup = backup_dir.join(format!("{}.{seconds}", file_name_of(path)));
     if backup.exists() {
         bail!("备份 {} 已存在", backup.display());
     }
@@ -350,7 +501,7 @@ fn move_to_backup(path: &Path, backup_parent: &Path) -> Result<PathBuf> {
     Ok(backup)
 }
 
-/// 比较两个材质包（zip 文件或文件夹）的内容是否完全相同。
+/// 比较两个条目（文件或文件夹）的内容是否完全相同。
 fn have_same_content(a: &Path, b: &Path) -> Result<bool> {
     let (meta_a, meta_b) = (
         fs::metadata(a).with_context(|| format!("读取 {} 的属性失败", a.display()))?,
@@ -411,7 +562,11 @@ fn have_same_file_content(a: &Path, b: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use anyhow::anyhow;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     use super::*;
     use crate::test_support::TempDir;
@@ -430,12 +585,40 @@ mod tests {
         }
     }
 
-    fn write_pack(game_dir: &Path, name: &str, content: &str) -> Result<PathBuf> {
-        let dir = game_dir.join(RESOURCE_PACKS_DIR);
+    fn write_asset(
+        kind: SharedAsset,
+        game_dir: &Path,
+        name: &str,
+        content: &[u8],
+    ) -> Result<PathBuf> {
+        let dir = game_dir.join(asset_dir(kind));
         fs::create_dir_all(&dir)?;
         let path = dir.join(name);
         fs::write(&path, content)?;
         Ok(path)
+    }
+
+    /// 按 Axiom 蓝图的分段格式构造一个只含 `DataVersion` 的最小蓝图。
+    fn build_blueprint(data_version: i32, marker: &str) -> Result<Vec<u8>> {
+        let mut nbt = vec![0x0a, 0x00, 0x00];
+        nbt.extend_from_slice(DATA_VERSION_TAG);
+        nbt.extend_from_slice(&data_version.to_be_bytes());
+        nbt.extend_from_slice(marker.as_bytes());
+        nbt.push(0x00);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&nbt)?;
+        let block_data = encoder.finish()?;
+
+        let mut bytes = BLUEPRINT_MAGIC.to_vec();
+        for section in [
+            b"header".as_slice(),
+            b"png".as_slice(),
+            block_data.as_slice(),
+        ] {
+            bytes.extend_from_slice(&(section.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(section);
+        }
+        Ok(bytes)
     }
 
     /// 记录收到的冲突并对每个冲突返回同一选择。
@@ -452,23 +635,31 @@ mod tests {
 
     #[test]
     fn copy_missing_copies_new_packs_and_asks_only_for_different_ones() -> Result<()> {
+        let kind = SharedAsset::ResourcePacks;
         let template_dir = TempDir::new("packs-copy-template")?;
         let target_dir = TempDir::new("packs-copy-target")?;
-        write_pack(template_dir.path(), "new.zip", "new")?;
-        write_pack(template_dir.path(), "same.zip", "same")?;
-        write_pack(template_dir.path(), "changed.zip", "template-version")?;
-        write_pack(target_dir.path(), "same.zip", "same")?;
-        let target_changed = write_pack(target_dir.path(), "changed.zip", "target")?;
+        write_asset(kind, template_dir.path(), "new.zip", b"new")?;
+        write_asset(kind, template_dir.path(), "same.zip", b"same")?;
+        write_asset(
+            kind,
+            template_dir.path(),
+            "changed.zip",
+            b"template-version",
+        )?;
+        write_asset(kind, target_dir.path(), "same.zip", b"same")?;
+        let target_changed = write_asset(kind, target_dir.path(), "changed.zip", b"target")?;
         let (template, target) = (
             instance(&template_dir, "旧包"),
             instance(&target_dir, "新包"),
         );
 
         let mut seen = Vec::new();
-        let result = sync_resource_packs(
+        let outcome = sync_shared_assets(
+            kind,
             &template,
             &target,
             &PackTransfer::CopyMissing,
+            None,
             &mut answer_all(ConflictChoice::UseIncoming, &mut seen),
             &mut no_log(),
         )?;
@@ -478,9 +669,9 @@ mod tests {
         assert_eq!(seen[0].existing.owner, "新包");
         assert_eq!(seen[0].incoming.owner, "旧包");
         assert_eq!(seen[0].incoming.size, "template-version".len() as u64);
-        assert_eq!(result.changed_paths.len(), 2);
+        assert_eq!(outcome.result.changed_paths.len(), 2);
         assert_eq!(fs::read_to_string(&target_changed)?, "template-version");
-        let backups: Vec<_> = fs::read_dir(target_dir.path().join(PACK_BACKUP_DIR))?
+        let backups: Vec<_> = fs::read_dir(target_dir.path().join("resourcepacks.bak"))?
             .filter_map(|entry| entry.ok())
             .collect();
         assert_eq!(backups.len(), 1);
@@ -490,54 +681,60 @@ mod tests {
 
     #[test]
     fn copy_missing_keeps_existing_when_user_chooses_so() -> Result<()> {
+        let kind = SharedAsset::ResourcePacks;
         let template_dir = TempDir::new("packs-keep-template")?;
         let target_dir = TempDir::new("packs-keep-target")?;
-        write_pack(template_dir.path(), "changed.zip", "template")?;
-        let target_changed = write_pack(target_dir.path(), "changed.zip", "target")?;
+        write_asset(kind, template_dir.path(), "changed.zip", b"template")?;
+        let target_changed = write_asset(kind, target_dir.path(), "changed.zip", b"target")?;
 
         let mut seen = Vec::new();
-        sync_resource_packs(
+        sync_shared_assets(
+            kind,
             &instance(&template_dir, "旧包"),
             &instance(&target_dir, "新包"),
             &PackTransfer::CopyMissing,
+            None,
             &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
             &mut no_log(),
         )?;
 
         assert_eq!(fs::read_to_string(&target_changed)?, "target");
-        assert!(!target_dir.path().join(PACK_BACKUP_DIR).exists());
+        assert!(!target_dir.path().join("resourcepacks.bak").exists());
         Ok(())
     }
 
     #[test]
     fn link_to_shared_merges_both_instances_and_links_them() -> Result<()> {
+        let kind = SharedAsset::ResourcePacks;
         let template_dir = TempDir::new("packs-shared-template")?;
         let target_dir = TempDir::new("packs-shared-target")?;
         let shared_root = TempDir::new("packs-shared-store")?;
-        write_pack(template_dir.path(), "common.zip", "template")?;
-        write_pack(template_dir.path(), "same.zip", "same")?;
-        write_pack(target_dir.path(), "common.zip", "target")?;
-        write_pack(target_dir.path(), "same.zip", "same")?;
-        let folder_pack = target_dir.path().join(RESOURCE_PACKS_DIR).join("bundled");
+        write_asset(kind, template_dir.path(), "common.zip", b"template")?;
+        write_asset(kind, template_dir.path(), "same.zip", b"same")?;
+        write_asset(kind, target_dir.path(), "common.zip", b"target")?;
+        write_asset(kind, target_dir.path(), "same.zip", b"same")?;
+        let folder_pack = target_dir.path().join(asset_dir(kind)).join("bundled");
         fs::create_dir_all(&folder_pack)?;
         fs::write(folder_pack.join("pack.mcmeta"), "{}")?;
 
         let mut seen = Vec::new();
-        let result = sync_resource_packs(
+        let outcome = sync_shared_assets(
+            kind,
             &instance(&template_dir, "旧包"),
             &instance(&target_dir, "新包"),
             &PackTransfer::LinkToShared(shared_root.path().to_path_buf()),
+            None,
             &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
             &mut no_log(),
         )?;
 
-        assert_eq!(result.changed_paths.len(), 2);
+        assert_eq!(outcome.result.changed_paths.len(), 2);
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].existing.owner, SHARED_OWNER);
         assert_eq!(seen[0].incoming.owner, "新包");
-        let shared = resolve_real_path(&shared_root.path().join(RESOURCE_PACKS_DIR))?;
+        let shared = resolve_real_path(&shared_root.path().join(shared_subdir(kind)))?;
         for game_dir in [template_dir.path(), target_dir.path()] {
-            let packs_dir = game_dir.join(RESOURCE_PACKS_DIR);
+            let packs_dir = game_dir.join(asset_dir(kind));
             assert!(is_link(&packs_dir)?);
             assert_eq!(resolve_real_path(&packs_dir)?, shared);
         }
@@ -571,6 +768,101 @@ mod tests {
 
         fs::write(b.path().join("assets/x.png"), "two")?;
         assert!(!have_same_content(a.path(), b.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_data_version_from_blueprint() -> Result<()> {
+        let dir = TempDir::new("blueprint-version")?;
+        let path = dir.path().join("tower.bp");
+        fs::write(&path, build_blueprint(5023, "tower")?)?;
+        assert_eq!(read_blueprint_data_version(&path)?, 5023);
+
+        fs::write(&path, b"not a blueprint")?;
+        assert!(read_blueprint_data_version(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn blueprint_copy_skips_newer_versions_and_ignores_ordering_file() -> Result<()> {
+        let kind = SharedAsset::AxiomBlueprints;
+        let template_dir = TempDir::new("bp-copy-template")?;
+        let target_dir = TempDir::new("bp-copy-target")?;
+        write_asset(
+            kind,
+            template_dir.path(),
+            "old.bp",
+            &build_blueprint(4903, "old")?,
+        )?;
+        write_asset(
+            kind,
+            template_dir.path(),
+            "new.bp",
+            &build_blueprint(5023, "new")?,
+        )?;
+        write_asset(kind, template_dir.path(), "broken.bp", b"broken")?;
+        write_asset(
+            kind,
+            template_dir.path(),
+            ".axiom_blueprint_ordering",
+            b"old.bp\n",
+        )?;
+
+        let mut seen = Vec::new();
+        let outcome = sync_shared_assets(
+            kind,
+            &instance(&template_dir, "26.3"),
+            &instance(&target_dir, "26.2"),
+            &PackTransfer::CopyMissing,
+            Some(4903),
+            &mut answer_all(ConflictChoice::UseIncoming, &mut seen),
+            &mut no_log(),
+        )?;
+
+        let target_blueprints = target_dir.path().join(asset_dir(kind));
+        assert!(target_blueprints.join("old.bp").is_file());
+        assert!(!target_blueprints.join("new.bp").exists());
+        assert!(!target_blueprints.join("broken.bp").exists());
+        assert!(!target_blueprints.join(".axiom_blueprint_ordering").exists());
+        assert_eq!(
+            outcome.added,
+            vec![(target_blueprints, vec!["old.bp".to_string()])]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blueprint_conflict_reports_data_versions() -> Result<()> {
+        let kind = SharedAsset::AxiomBlueprints;
+        let template_dir = TempDir::new("bp-conflict-template")?;
+        let target_dir = TempDir::new("bp-conflict-target")?;
+        write_asset(
+            kind,
+            template_dir.path(),
+            "tower.bp",
+            &build_blueprint(4903, "a")?,
+        )?;
+        write_asset(
+            kind,
+            target_dir.path(),
+            "tower.bp",
+            &build_blueprint(4440, "b")?,
+        )?;
+
+        let mut seen = Vec::new();
+        sync_shared_assets(
+            kind,
+            &instance(&template_dir, "旧包"),
+            &instance(&target_dir, "新包"),
+            &PackTransfer::CopyMissing,
+            Some(4903),
+            &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
+            &mut no_log(),
+        )?;
+
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].existing.data_version, Some(4440));
+        assert_eq!(seen[0].incoming.data_version, Some(4903));
         Ok(())
     }
 }

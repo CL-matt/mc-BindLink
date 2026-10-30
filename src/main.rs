@@ -21,7 +21,7 @@ use eframe::egui;
 
 use crate::types::{
     CacheTransfer, ConflictChoice, DetectedInstance, MigrationRequest, MigrationResult,
-    PackConflict, PackTransfer, PackVersion, ServerCache, SyncMode,
+    PackConflict, PackTransfer, PackVersion, ServerCache, SharedAsset, SyncMode,
 };
 
 const CJK_FONT_NAME: &str = "msyh";
@@ -42,7 +42,7 @@ fn main() -> eframe::Result {
 
 enum WorkerMessage {
     Log(String),
-    /// 后台线程遇到材质包同名冲突，阻塞等待界面通过附带的发送端回传用户选择。
+    /// 后台线程遇到材质包或蓝图同名冲突，阻塞等待界面通过附带的发送端回传用户选择。
     Conflicts(Vec<PackConflict>, Sender<Vec<ConflictChoice>>),
     Finished(Result<MigrationResult>),
 }
@@ -67,11 +67,19 @@ impl PackChoice {
         PackChoice::LinkToShared,
     ];
 
-    fn label(self) -> &'static str {
-        match self {
-            PackChoice::Skip => "不处理",
-            PackChoice::CopyMissing => "复制缺少的材质包",
-            PackChoice::LinkToShared => "Junction 指向共享目录（同步启用列表）",
+    fn label(self, kind: SharedAsset) -> &'static str {
+        match (self, kind) {
+            (PackChoice::Skip, _) => "不处理",
+            (PackChoice::CopyMissing, SharedAsset::ResourcePacks) => "复制缺少的材质包",
+            (PackChoice::CopyMissing, SharedAsset::AxiomBlueprints) => {
+                "复制缺少的蓝图（跳过高于目标版本的蓝图）"
+            }
+            (PackChoice::LinkToShared, SharedAsset::ResourcePacks) => {
+                "Junction 指向共享目录（同步启用列表）"
+            }
+            (PackChoice::LinkToShared, SharedAsset::AxiomBlueprints) => {
+                "Junction 指向共享目录（仅限两个实例版本相同）"
+            }
         }
     }
 
@@ -155,6 +163,7 @@ struct MigratorApp {
     voxy_choice: CacheChoice,
     bobby_choice: CacheChoice,
     pack_choice: PackChoice,
+    blueprint_choice: PackChoice,
     shared_dir: Option<PathBuf>,
     logs: Vec<String>,
     worker: Option<Receiver<WorkerMessage>>,
@@ -175,6 +184,7 @@ impl MigratorApp {
             voxy_choice: CacheChoice::Skip,
             bobby_choice: CacheChoice::Skip,
             pack_choice: PackChoice::Skip,
+            blueprint_choice: PackChoice::Skip,
             shared_dir: None,
             logs: Vec::new(),
             worker: None,
@@ -222,12 +232,14 @@ impl MigratorApp {
         let voxy = self.voxy_choice.to_transfer(&self.shared_dir)?;
         let bobby = self.bobby_choice.to_transfer(&self.shared_dir)?;
         let resource_packs = self.pack_choice.to_transfer(&self.shared_dir)?;
+        let axiom_blueprints = self.blueprint_choice.to_transfer(&self.shared_dir)?;
         if !self.sync_options
             && !self.sync_mod_configs
             && !self.sync_maps
             && voxy.is_none()
             && bobby.is_none()
             && resource_packs.is_none()
+            && axiom_blueprints.is_none()
         {
             return Err("请至少选择一项同步内容".to_string());
         }
@@ -241,6 +253,7 @@ impl MigratorApp {
             voxy,
             bobby,
             resource_packs,
+            axiom_blueprints,
         })
     }
 
@@ -360,6 +373,7 @@ impl MigratorApp {
         self.sync_maps = true;
         self.voxy_choice = preset.cache_choice;
         self.bobby_choice = preset.cache_choice;
+        self.blueprint_choice = PackChoice::Skip;
         self.logs.push(format!("已应用固定配置：{}", preset.name));
     }
 
@@ -397,20 +411,18 @@ impl MigratorApp {
                 show_cache_combo(ui, kind, choice);
                 ui.end_row();
             }
-            ui.label("材质包");
-            egui::ComboBox::from_id_salt("pack_combo")
-                .width(520.0)
-                .selected_text(self.pack_choice.label())
-                .show_ui(ui, |ui| {
-                    for option in PackChoice::ALL {
-                        ui.selectable_value(&mut self.pack_choice, option, option.label());
-                    }
-                });
-            ui.end_row();
+            for (kind, choice) in [
+                (SharedAsset::ResourcePacks, &mut self.pack_choice),
+                (SharedAsset::AxiomBlueprints, &mut self.blueprint_choice),
+            ] {
+                ui.label(kind.to_string());
+                show_pack_combo(ui, kind, choice);
+                ui.end_row();
+            }
         });
         let needs_shared_dir = [self.voxy_choice, self.bobby_choice]
             .contains(&CacheChoice::LinkToShared)
-            || self.pack_choice == PackChoice::LinkToShared;
+            || [self.pack_choice, self.blueprint_choice].contains(&PackChoice::LinkToShared);
         if needs_shared_dir {
             ui.horizontal(|ui| {
                 if ui.button("选择共享目录…").clicked()
@@ -432,8 +444,14 @@ impl MigratorApp {
         };
         let mut confirmed = false;
         egui::Modal::new(egui::Id::unique("pack_conflicts")).show(ctx, |ui| {
-            ui.heading("材质包同名冲突");
-            ui.label("以下材质包名称相同但内容不同，请逐个决定保留现有版本还是使用新版本。被替换的版本会移入 resourcepacks.bak 备份目录。");
+            let kind = dialog
+                .conflicts
+                .first()
+                .map_or(SharedAsset::ResourcePacks, |conflict| conflict.kind);
+            ui.heading(format!("{kind}同名冲突"));
+            ui.label(format!(
+                "以下{kind}名称相同但内容不同，请逐个决定保留现有版本还是使用新版本。被替换的版本会移入同级的 .bak 备份目录。"
+            ));
             ui.separator();
             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                 for (conflict, choice) in dialog.conflicts.iter().zip(&mut dialog.choices) {
@@ -514,12 +532,27 @@ impl eframe::App for MigratorApp {
 }
 
 fn describe_version(version: &PackVersion) -> String {
-    format!(
+    let mut text = format!(
         "{} · {} · {}",
         version.owner,
         format_size(version.size),
         format_age(version.modified)
-    )
+    );
+    if let Some(data_version) = version.data_version {
+        text.push_str(&format!(" · 数据版本 {data_version}"));
+    }
+    text
+}
+
+fn show_pack_combo(ui: &mut egui::Ui, kind: SharedAsset, choice: &mut PackChoice) {
+    egui::ComboBox::from_id_salt(format!("pack_combo_{kind}"))
+        .width(520.0)
+        .selected_text(choice.label(kind))
+        .show_ui(ui, |ui| {
+            for option in PackChoice::ALL {
+                ui.selectable_value(choice, option, option.label(kind));
+            }
+        });
 }
 
 fn format_size(bytes: u64) -> String {
