@@ -11,7 +11,7 @@ use zip::ZipArchive;
 use zip::result::ZipError;
 
 use crate::map_sync;
-use crate::types::{MigrationRequest, MigrationResult, SyncMode};
+use crate::types::{MigrationRequest, MigrationResult, ServerCache, SyncMode};
 
 const OPTIONS_FILE_NAME: &str = "options.txt";
 const KEY_PREFIX: &str = "key_";
@@ -77,10 +77,17 @@ pub fn run_migration(
             .map(|step| merge_result(&mut result, step));
         record_step_failure("地图与路点同步", outcome, log, &mut result);
     }
-    if let Some(method) = &request.voxy {
-        let outcome = map_sync::transfer_voxy_caches(template_dir, target_dir, method, log)
+    let caches = [
+        (ServerCache::Voxy, &request.voxy),
+        (ServerCache::Bobby, &request.bobby),
+    ];
+    for (kind, method) in caches {
+        let Some(method) = method else {
+            continue;
+        };
+        let outcome = map_sync::transfer_server_caches(kind, template_dir, target_dir, method, log)
             .map(|step| merge_result(&mut result, step));
-        record_step_failure("Voxy 缓存迁移", outcome, log, &mut result);
+        record_step_failure(&format!("{kind} 缓存迁移"), outcome, log, &mut result);
     }
 
     log(format!(

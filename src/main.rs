@@ -17,7 +17,9 @@ use std::thread;
 use anyhow::{Context, Result};
 use eframe::egui;
 
-use crate::types::{DetectedInstance, MigrationRequest, MigrationResult, SyncMode, VoxyTransfer};
+use crate::types::{
+    CacheTransfer, DetectedInstance, MigrationRequest, MigrationResult, ServerCache, SyncMode,
+};
 
 const CJK_FONT_NAME: &str = "msyh";
 
@@ -41,11 +43,40 @@ enum WorkerMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VoxyChoice {
+enum CacheChoice {
     Skip,
     Copy,
     LinkToSource,
     LinkToShared,
+}
+
+impl CacheChoice {
+    const ALL: [CacheChoice; 4] = [
+        CacheChoice::Skip,
+        CacheChoice::Copy,
+        CacheChoice::LinkToSource,
+        CacheChoice::LinkToShared,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            CacheChoice::Skip => "不处理",
+            CacheChoice::Copy => "物理复制（迁移后将删除源缓存时选用）",
+            CacheChoice::LinkToSource => "Junction 指向源实例（源实例继续使用时选用）",
+            CacheChoice::LinkToShared => "Junction 指向共享目录（同一服务器反复更新整合包时选用）",
+        }
+    }
+
+    fn to_transfer(self, shared_dir: &Option<PathBuf>) -> Result<Option<CacheTransfer>, String> {
+        Ok(match self {
+            CacheChoice::Skip => None,
+            CacheChoice::Copy => Some(CacheTransfer::Copy),
+            CacheChoice::LinkToSource => Some(CacheTransfer::LinkToSource),
+            CacheChoice::LinkToShared => Some(CacheTransfer::LinkToShared(
+                shared_dir.clone().ok_or("请先选择缓存共享目录")?,
+            )),
+        })
+    }
 }
 
 struct MigratorApp {
@@ -57,7 +88,8 @@ struct MigratorApp {
     sync_options: bool,
     sync_mod_configs: bool,
     sync_maps: bool,
-    voxy_choice: VoxyChoice,
+    voxy_choice: CacheChoice,
+    bobby_choice: CacheChoice,
     shared_dir: Option<PathBuf>,
     logs: Vec<String>,
     worker: Option<Receiver<WorkerMessage>>,
@@ -74,7 +106,8 @@ impl MigratorApp {
             sync_options: true,
             sync_mod_configs: true,
             sync_maps: false,
-            voxy_choice: VoxyChoice::Skip,
+            voxy_choice: CacheChoice::Skip,
+            bobby_choice: CacheChoice::Skip,
             shared_dir: None,
             logs: Vec::new(),
             worker: None,
@@ -118,15 +151,14 @@ impl MigratorApp {
         if template.game_dir == target.game_dir {
             return Err("模板实例与目标实例不能相同".to_string());
         }
-        let voxy = match self.voxy_choice {
-            VoxyChoice::Skip => None,
-            VoxyChoice::Copy => Some(VoxyTransfer::Copy),
-            VoxyChoice::LinkToSource => Some(VoxyTransfer::LinkToSource),
-            VoxyChoice::LinkToShared => Some(VoxyTransfer::LinkToShared(
-                self.shared_dir.clone().ok_or("请先选择 Voxy 共享目录")?,
-            )),
-        };
-        if !self.sync_options && !self.sync_mod_configs && !self.sync_maps && voxy.is_none() {
+        let voxy = self.voxy_choice.to_transfer(&self.shared_dir)?;
+        let bobby = self.bobby_choice.to_transfer(&self.shared_dir)?;
+        if !self.sync_options
+            && !self.sync_mod_configs
+            && !self.sync_maps
+            && voxy.is_none()
+            && bobby.is_none()
+        {
             return Err("请至少选择一项同步内容".to_string());
         }
         Ok(MigrationRequest {
@@ -137,6 +169,7 @@ impl MigratorApp {
             sync_mod_configs: self.sync_mod_configs,
             sync_maps: self.sync_maps,
             voxy,
+            bobby,
         })
     }
 
@@ -150,7 +183,7 @@ impl MigratorApp {
         };
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
-        // 复制 Voxy 缓存可能耗时数分钟，放到后台线程以免阻塞界面
+        // 复制 Voxy 或 Bobby 缓存可能耗时数分钟，放到后台线程以免阻塞界面
         thread::spawn(move || {
             // 发送失败只会发生在窗口关闭、接收端已释放之后，此时没有可写日志的地方
             let mut log = |message: String| {
@@ -246,24 +279,19 @@ impl MigratorApp {
         });
         ui.checkbox(&mut self.sync_maps, "地图与路点（Xaero）");
 
-        ui.label("Voxy 缓存");
-        ui.radio_value(&mut self.voxy_choice, VoxyChoice::Skip, "不处理");
-        ui.radio_value(
-            &mut self.voxy_choice,
-            VoxyChoice::Copy,
-            "物理复制（迁移后将删除源缓存时选用）",
-        );
-        ui.radio_value(
-            &mut self.voxy_choice,
-            VoxyChoice::LinkToSource,
-            "Junction 指向源实例（源实例继续使用时选用）",
-        );
-        ui.radio_value(
-            &mut self.voxy_choice,
-            VoxyChoice::LinkToShared,
-            "Junction 指向共享目录（同一服务器反复更新整合包时选用）",
-        );
-        if self.voxy_choice == VoxyChoice::LinkToShared {
+        egui::Grid::new("cache_grid").num_columns(2).show(ui, |ui| {
+            for (kind, choice) in [
+                (ServerCache::Voxy, &mut self.voxy_choice),
+                (ServerCache::Bobby, &mut self.bobby_choice),
+            ] {
+                ui.label(format!("{kind} 缓存"));
+                show_cache_combo(ui, kind, choice);
+                ui.end_row();
+            }
+        });
+        let needs_shared_dir =
+            [self.voxy_choice, self.bobby_choice].contains(&CacheChoice::LinkToShared);
+        if needs_shared_dir {
             ui.horizontal(|ui| {
                 if ui.button("选择共享目录…").clicked()
                     && let Some(dir) = rfd::FileDialog::new().pick_folder()
@@ -339,6 +367,17 @@ fn show_instance_combo(
             for (index, instance) in instances.iter().enumerate() {
                 ui.selectable_value(selected, Some(index), instance.to_string())
                     .on_hover_text(instance.game_dir.display().to_string());
+            }
+        });
+}
+
+fn show_cache_combo(ui: &mut egui::Ui, kind: ServerCache, choice: &mut CacheChoice) {
+    egui::ComboBox::from_id_salt(format!("cache_combo_{kind}"))
+        .width(520.0)
+        .selected_text(choice.label())
+        .show_ui(ui, |ui| {
+            for option in CacheChoice::ALL {
+                ui.selectable_value(choice, option, option.label());
             }
         });
 }

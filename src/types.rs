@@ -50,9 +50,26 @@ pub enum SyncMode {
     FullOverwrite,
 }
 
-/// Voxy 缓存的迁移方式，每次迁移由用户选择。
+/// 按服务器地址分子目录存放的客户端缓存，迁移规则相同，仅目录位置不同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerCache {
+    Voxy,
+    Bobby,
+}
+
+impl fmt::Display for ServerCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            ServerCache::Voxy => "Voxy",
+            ServerCache::Bobby => "Bobby",
+        };
+        f.write_str(label)
+    }
+}
+
+/// 服务器缓存的迁移方式，每次迁移由用户为每种缓存分别选择。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VoxyTransfer {
+pub enum CacheTransfer {
     /// 物理复制，用于迁移后将删除源缓存的场景。
     Copy,
     /// 目标建立 Junction 指向源实例的缓存目录。
@@ -71,7 +88,9 @@ pub struct MigrationRequest {
     pub sync_mod_configs: bool,
     pub sync_maps: bool,
     /// 为 `None` 时不处理 Voxy 缓存。
-    pub voxy: Option<VoxyTransfer>,
+    pub voxy: Option<CacheTransfer>,
+    /// 为 `None` 时不处理 Bobby 缓存。
+    pub bobby: Option<CacheTransfer>,
 }
 
 /// 一次迁移的执行结果，供界面汇总展示。

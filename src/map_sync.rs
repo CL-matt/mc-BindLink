@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use walkdir::WalkDir;
 
-use crate::types::{MigrationResult, VoxyTransfer};
+use crate::types::{CacheTransfer, MigrationResult, ServerCache};
 
 /// 以世界键（单人存档名或 `Multiplayer_<服务器地址>`）为子目录的地图与路点根目录。
 const MAP_ROOTS: &[&str] = &[
@@ -18,8 +18,6 @@ const MAP_ROOTS: &[&str] = &[
     "XaeroWaypoints",
     "XaeroWorldMap",
 ];
-const VOXY_SAVES_DIR: &str = ".voxy/saves";
-const ROCKSDB_LOCK_FILE: &str = "LOCK";
 const ERROR_SHARING_VIOLATION: i32 = 32;
 const ERROR_LOCK_VIOLATION: i32 = 33;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -130,40 +128,57 @@ fn modified_time(path: &Path) -> Result<SystemTime> {
         .with_context(|| format!("读取 {} 的修改时间失败", path.display()))
 }
 
-/// 把模板实例 `.voxy/saves/` 下每个世界的缓存按 `method` 迁移到目标实例。
+/// 缓存在游戏目录中的相对位置，其下每个子目录对应一个世界或服务器地址。
+fn cache_root(kind: ServerCache) -> &'static str {
+    match kind {
+        ServerCache::Voxy => ".voxy/saves",
+        ServerCache::Bobby => ".bobby",
+    }
+}
+
+/// 共享目录下按缓存种类分子目录，避免 Voxy 与 Bobby 的同名服务器目录互相冲突。
+fn shared_subdir(kind: ServerCache) -> &'static str {
+    match kind {
+        ServerCache::Voxy => "voxy",
+        ServerCache::Bobby => "bobby",
+    }
+}
+
+/// 把模板实例中 `kind` 缓存的每个世界或服务器目录按 `method` 迁移到目标实例。
 ///
-/// 单个世界失败时记录警告并继续处理其余世界。
-pub fn transfer_voxy_caches(
+/// 单个目录失败时记录警告并继续处理其余目录。
+pub fn transfer_server_caches(
+    kind: ServerCache,
     template_dir: &Path,
     target_dir: &Path,
-    method: &VoxyTransfer,
+    method: &CacheTransfer,
     log: &mut dyn FnMut(String),
 ) -> Result<MigrationResult> {
     let mut result = MigrationResult::default();
-    let source_saves = template_dir.join(VOXY_SAVES_DIR);
-    if !source_saves.is_dir() {
-        log("Voxy：模板实例没有缓存目录，跳过".to_string());
+    let source_root = template_dir.join(cache_root(kind));
+    if !source_root.is_dir() {
+        log(format!("{kind}：模板实例没有缓存目录，跳过"));
         return Ok(result);
     }
-    let target_saves = target_dir.join(VOXY_SAVES_DIR);
-    fs::create_dir_all(&target_saves)
-        .with_context(|| format!("创建目录 {} 失败", target_saves.display()))?;
+    let target_root = target_dir.join(cache_root(kind));
+    fs::create_dir_all(&target_root)
+        .with_context(|| format!("创建目录 {} 失败", target_root.display()))?;
 
-    for entry in fs::read_dir(&source_saves)
-        .with_context(|| format!("读取目录 {} 失败", source_saves.display()))?
+    for entry in fs::read_dir(&source_root)
+        .with_context(|| format!("读取目录 {} 失败", source_root.display()))?
     {
-        let entry = entry.with_context(|| format!("读取目录 {} 失败", source_saves.display()))?;
+        let entry = entry.with_context(|| format!("读取目录 {} 失败", source_root.display()))?;
         let name = entry.file_name();
         // 跳过本程序此前重命名留下的备份目录
         if !entry.path().is_dir() || name.to_string_lossy().ends_with(".bak") {
             continue;
         }
-        let target = target_saves.join(&name);
-        match transfer_one_voxy_cache(&entry.path(), &target, method, log) {
+        let target = target_root.join(&name);
+        match transfer_one_cache(kind, &entry.path(), &target, method, log) {
             Ok(true) => result.changed_paths.push(target),
             Ok(false) => {}
             Err(err) => {
-                let message = format!("Voxy：迁移 {} 失败：{err:#}", name.to_string_lossy());
+                let message = format!("{kind}：迁移 {} 失败：{err:#}", name.to_string_lossy());
                 log(message.clone());
                 result.warnings.push(message);
             }
@@ -172,26 +187,28 @@ pub fn transfer_voxy_caches(
     Ok(result)
 }
 
-/// 迁移单个世界的缓存，目标已与源共用同一份缓存时返回 `false`。
-fn transfer_one_voxy_cache(
+/// 迁移单个世界或服务器的缓存，目标已与源共用同一份缓存时返回 `false`。
+fn transfer_one_cache(
+    kind: ServerCache,
     source: &Path,
     target: &Path,
-    method: &VoxyTransfer,
+    method: &CacheTransfer,
     log: &mut dyn FnMut(String),
 ) -> Result<bool> {
     let real_source = resolve_real_path(source)?;
     if target.exists() && resolve_real_path(target)? == real_source {
-        log(format!("Voxy：{} 已与源共用缓存，跳过", target.display()));
+        log(format!("{kind}：{} 已与源共用缓存，跳过", target.display()));
         return Ok(false);
     }
 
     let link_destination = match method {
-        VoxyTransfer::Copy => {
+        CacheTransfer::Copy => {
             ensure_cache_not_in_use(&real_source)?;
             None
         }
-        VoxyTransfer::LinkToSource => Some(real_source.clone()),
-        VoxyTransfer::LinkToShared(shared_root) => Some(prepare_shared_cache(
+        CacheTransfer::LinkToSource => Some(real_source.clone()),
+        CacheTransfer::LinkToShared(shared_root) => Some(prepare_shared_cache(
+            kind,
             source,
             &real_source,
             shared_root,
@@ -203,7 +220,7 @@ fn transfer_one_voxy_cache(
         ensure_cache_not_in_use(target)?;
         let backup = rename_aside(target)?;
         log(format!(
-            "Voxy：已将目标原有缓存重命名为 {}",
+            "{kind}：已将目标原有缓存重命名为 {}",
             backup.display()
         ));
     }
@@ -212,14 +229,14 @@ fn transfer_one_voxy_cache(
         Some(destination) => {
             create_junction(target, &destination)?;
             log(format!(
-                "Voxy：{} → {}",
+                "{kind}：{} → {}",
                 target.display(),
                 destination.display()
             ));
         }
         None => {
             copy_dir_recursive(&real_source, target)?;
-            log(format!("Voxy：已复制 {}", target.display()));
+            log(format!("{kind}：已复制 {}", target.display()));
         }
     }
     Ok(true)
@@ -227,6 +244,7 @@ fn transfer_one_voxy_cache(
 
 /// 确保源缓存位于共享目录并由源实例链接过去，返回共享目录中的缓存路径。
 fn prepare_shared_cache(
+    kind: ServerCache,
     source: &Path,
     real_source: &Path,
     shared_root: &Path,
@@ -235,6 +253,7 @@ fn prepare_shared_cache(
     let name = source
         .file_name()
         .ok_or_else(|| anyhow!("无法取得目录名：{}", source.display()))?;
+    let shared_root = shared_root.join(shared_subdir(kind));
     let shared = shared_root.join(name);
     if shared.exists() && resolve_real_path(&shared)? == real_source {
         return Ok(shared);
@@ -251,7 +270,7 @@ fn prepare_shared_cache(
     }
 
     ensure_cache_not_in_use(real_source)?;
-    fs::create_dir_all(shared_root)
+    fs::create_dir_all(&shared_root)
         .with_context(|| format!("创建目录 {} 失败", shared_root.display()))?;
     move_dir(real_source, &shared)?;
     // 源实例的链接建立失败时把缓存移回原处，避免源实例丢失缓存
@@ -265,7 +284,7 @@ fn prepare_shared_cache(
         return Err(err);
     }
     log(format!(
-        "Voxy：已将源缓存移动到 {} 并在源实例建立链接",
+        "{kind}：已将源缓存移动到 {} 并在源实例建立链接",
         shared.display()
     ));
     Ok(shared)
@@ -288,16 +307,18 @@ fn is_link(path: &Path) -> Result<bool> {
     Ok(metadata.file_type().is_symlink())
 }
 
-/// 游戏运行时 RocksDB 独占持有 `LOCK` 文件，以不共享模式打开失败即说明缓存正在使用。
+/// 逐个以不共享模式打开缓存中的文件，任何文件仍被其他进程打开时都会失败。
+///
+/// 游戏运行时会一直打开正在读写的缓存文件（Voxy 的 RocksDB、Bobby 的区块文件），
+/// 据此判断对应实例是否正在运行。
 fn ensure_cache_not_in_use(cache_dir: &Path) -> Result<()> {
     for entry in WalkDir::new(cache_dir) {
         let entry = entry.with_context(|| format!("遍历 {} 失败", cache_dir.display()))?;
-        if !entry.file_type().is_file() || entry.file_name() != ROCKSDB_LOCK_FILE {
+        if !entry.file_type().is_file() {
             continue;
         }
         let opened = OpenOptions::new()
             .read(true)
-            .write(true)
             .share_mode(0)
             .open(entry.path());
         match opened {
@@ -450,11 +471,24 @@ mod tests {
     }
 
     fn create_voxy_world(game_dir: &Path, world: &str, content: &str) -> Result<PathBuf> {
-        let dir = game_dir.join(VOXY_SAVES_DIR).join(world);
+        let dir = game_dir.join(cache_root(ServerCache::Voxy)).join(world);
         fs::create_dir_all(dir.join("hash/storage"))?;
         fs::write(dir.join("config.json"), content)?;
-        fs::write(dir.join("hash/storage").join(ROCKSDB_LOCK_FILE), "")?;
+        fs::write(dir.join("hash/storage/LOCK"), "")?;
         Ok(dir)
+    }
+
+    fn create_bobby_server(game_dir: &Path, server: &str) -> Result<PathBuf> {
+        let dir = game_dir.join(cache_root(ServerCache::Bobby)).join(server);
+        let dimension = dir.join("123/minecraft/overworld");
+        fs::create_dir_all(&dimension)?;
+        fs::write(dimension.join("r.0.0.mca"), "region")?;
+        fs::write(dimension.join("last_access"), "")?;
+        Ok(dir)
+    }
+
+    fn voxy_dir(game_dir: &Path, world: &str) -> PathBuf {
+        game_dir.join(cache_root(ServerCache::Voxy)).join(world)
     }
 
     #[test]
@@ -464,10 +498,11 @@ mod tests {
         create_voxy_world(template.path(), "example.com", "template")?;
         let target_world = create_voxy_world(target.path(), "example.com", "target")?;
 
-        let result = transfer_voxy_caches(
+        let result = transfer_server_caches(
+            ServerCache::Voxy,
             template.path(),
             target.path(),
-            &VoxyTransfer::Copy,
+            &CacheTransfer::Copy,
             &mut no_log(),
         )?;
 
@@ -477,7 +512,7 @@ mod tests {
             "template"
         );
         assert!(!is_link(&target_world)?);
-        let backups = fs::read_dir(target.path().join(VOXY_SAVES_DIR))?
+        let backups = fs::read_dir(target.path().join(cache_root(ServerCache::Voxy)))?
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
             .count();
@@ -492,10 +527,11 @@ mod tests {
         let source_world = create_voxy_world(template.path(), "example.com", "template")?;
         let target_world = create_voxy_world(target.path(), "example.com", "target")?;
 
-        let result = transfer_voxy_caches(
+        let result = transfer_server_caches(
+            ServerCache::Voxy,
             template.path(),
             target.path(),
-            &VoxyTransfer::LinkToSource,
+            &CacheTransfer::LinkToSource,
             &mut no_log(),
         )?;
 
@@ -516,12 +552,21 @@ mod tests {
         let next_target = TempDir::new("voxy-shared-next")?;
         let shared = TempDir::new("voxy-shared-store")?;
         let source_world = create_voxy_world(template.path(), "example.com", "template")?;
-        let method = VoxyTransfer::LinkToShared(shared.path().to_path_buf());
+        let method = CacheTransfer::LinkToShared(shared.path().to_path_buf());
+        let transfer = |target_dir: &Path| {
+            transfer_server_caches(
+                ServerCache::Voxy,
+                template.path(),
+                target_dir,
+                &method,
+                &mut no_log(),
+            )
+        };
 
-        let first = transfer_voxy_caches(template.path(), target.path(), &method, &mut no_log())?;
+        let first = transfer(target.path())?;
         assert!(first.warnings.is_empty(), "{:?}", first.warnings);
-        let shared_world = resolve_real_path(&shared.path().join("example.com"))?;
-        let target_world = target.path().join(VOXY_SAVES_DIR).join("example.com");
+        let shared_world = resolve_real_path(&shared.path().join("voxy/example.com"))?;
+        let target_world = voxy_dir(target.path(), "example.com");
 
         assert!(is_link(&source_world)?);
         assert!(is_link(&target_world)?);
@@ -532,13 +577,49 @@ mod tests {
             "template"
         );
 
-        transfer_voxy_caches(template.path(), next_target.path(), &method, &mut no_log())?;
-        let next_world = next_target.path().join(VOXY_SAVES_DIR).join("example.com");
+        transfer(next_target.path())?;
+        let next_world = voxy_dir(next_target.path(), "example.com");
         assert_eq!(resolve_real_path(&next_world)?, shared_world);
 
-        let repeated =
-            transfer_voxy_caches(template.path(), target.path(), &method, &mut no_log())?;
+        let repeated = transfer(target.path())?;
         assert!(repeated.changed_paths.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn voxy_and_bobby_share_one_root_without_conflict() -> Result<()> {
+        let template = TempDir::new("both-shared-template")?;
+        let target = TempDir::new("both-shared-target")?;
+        let shared = TempDir::new("both-shared-store")?;
+        create_voxy_world(template.path(), "example.com", "template")?;
+        create_bobby_server(template.path(), "example.com")?;
+        let method = CacheTransfer::LinkToShared(shared.path().to_path_buf());
+
+        for kind in [ServerCache::Voxy, ServerCache::Bobby] {
+            let result = transfer_server_caches(
+                kind,
+                template.path(),
+                target.path(),
+                &method,
+                &mut no_log(),
+            )?;
+            assert!(result.warnings.is_empty(), "{kind}: {:?}", result.warnings);
+        }
+
+        let bobby_server = target
+            .path()
+            .join(cache_root(ServerCache::Bobby))
+            .join("example.com");
+        assert_eq!(
+            resolve_real_path(&bobby_server)?,
+            resolve_real_path(&shared.path().join("bobby/example.com"))?
+        );
+        assert!(
+            bobby_server
+                .join("123/minecraft/overworld/r.0.0.mca")
+                .is_file()
+        );
+        assert!(shared.path().join("voxy/example.com/config.json").is_file());
         Ok(())
     }
 
@@ -551,24 +632,43 @@ mod tests {
             .read(true)
             .write(true)
             .share_mode(0)
-            .open(source_world.join("hash/storage").join(ROCKSDB_LOCK_FILE))?;
+            .open(source_world.join("hash/storage/LOCK"))?;
 
-        let result = transfer_voxy_caches(
+        let result = transfer_server_caches(
+            ServerCache::Voxy,
             template.path(),
             target.path(),
-            &VoxyTransfer::Copy,
+            &CacheTransfer::Copy,
             &mut no_log(),
         )?;
 
         assert!(result.changed_paths.is_empty());
         assert_eq!(result.warnings.len(), 1);
-        assert!(
-            !target
-                .path()
-                .join(VOXY_SAVES_DIR)
-                .join("example.com")
-                .exists()
-        );
+        assert!(!voxy_dir(target.path(), "example.com").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn bobby_copy_refuses_region_file_opened_with_shared_access() -> Result<()> {
+        let template = TempDir::new("bobby-lock-template")?;
+        let target = TempDir::new("bobby-lock-target")?;
+        let server = create_bobby_server(template.path(), "example.com")?;
+        // 默认共享模式与游戏打开区块文件的方式一致，允许其他进程同时读写
+        let _held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(server.join("123/minecraft/overworld/r.0.0.mca"))?;
+
+        let result = transfer_server_caches(
+            ServerCache::Bobby,
+            template.path(),
+            target.path(),
+            &CacheTransfer::Copy,
+            &mut no_log(),
+        )?;
+
+        assert!(result.changed_paths.is_empty());
+        assert_eq!(result.warnings.len(), 1);
         Ok(())
     }
 }
