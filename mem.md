@@ -88,6 +88,19 @@
   | 洛林 | 局部合并 | 物理复制 |
   | neko喵喵喵 | 全量覆写 | Junction 指向共享目录（共享目录仍需用户选择） |
 
+- 固定配置不修改材质包的处理方式。
+
+### 2.7 材质包同步 (`pack_sync.rs`)
+- 目录：实例的 `resourcepacks/`，其中每个 `.zip` 文件或文件夹为一个材质包。光影包（`shaderpacks/`）不同步。
+- Junction 只能链接文件夹，单个 zip 无法免权限跨分区链接，因此共享时以整个 `resourcepacks/` 目录为单位。
+- 处理方式由用户选择：
+  - 不处理。
+  - 复制缺少的材质包：模板有而目标没有的直接复制；内容完全相同的跳过；同名但内容不同的交给用户决定。
+  - Junction 指向共享目录：共享目录为 `<共享目录>\resourcepacks`，与 Voxy、Bobby 共用同一个用户选择的共享目录。先处理模板再处理目标：共享目录不存在时把该实例的整个 `resourcepacks/` 移入；已存在时逐个并入，共享目录缺少的移入，内容相同的跳过，同名但内容不同的交给用户决定；并入后实例目录中剩余的材质包整体重命名为 `resourcepacks.<unix秒>.bak` 保留（为空则删除），再建立 Junction。实例的 `resourcepacks/` 已链接到别处时拒绝合并。
+- 同名冲突：比较文件或文件夹的全部字节，内容不同时弹窗列出每个冲突的名称，以及双方的来源（实例名或"共享目录"）、大小与修改距今天数，由用户逐个选择"保留现有"或"使用新版本"，默认保留现有。被替换的版本移入备份目录：复制模式为 `<目标游戏目录>\resourcepacks.bak\<名称>.<unix秒>`，共享模式为 `<共享目录>\resourcepacks.bak\<名称>.<unix秒>`；备份放在 `resourcepacks/` 之外，避免游戏把备份列为可选材质包。
+- 移动或替换前按 §2.5 的逐文件独占打开方式检查占用。
+- 启用列表：仅在共享模式下，把模板 `options.txt` 的 `resourcePacks` 与 `incompatibleResourcePacks` 写入目标（写入前备份）；只有共享目录能保证两个实例拥有相同的材质包文件。复制模式与全量覆写仍保留目标原有的启用列表。
+
 ---
 
 ## 3. 技术栈与模块设计
@@ -102,12 +115,14 @@
 - `src/main.rs`: 界面逻辑、状态存储、事件处理与日志流展示。
 - `src/engine.rs`: 核心业务逻辑（`options.txt` 解析、Mod 检测、配置读写与备份）。
 - `src/launcher.rs`: 启动器路径嗅探、隔离版本扫描。
-- `src/map_sync.rs`: 地图路点目录递归同步与 Voxy、Bobby 缓存链接或拷贝。
+- `src/map_sync.rs`: 地图路点目录递归同步与 Voxy、Bobby 缓存链接或拷贝；同时提供 Junction、移动、占用检测等目录操作供 `pack_sync.rs` 复用。
+- `src/pack_sync.rs`: 材质包复制、合并到共享目录与同名冲突处理。
 - `src/types.rs`: 全局公用枚举与数据结构定义。
 
 ### 核心数据结构
 - `DetectedInstance` 包含 `launcher: LauncherKind` 字段，`LauncherKind` 取值为 `Pcl2 / Unknown`，定义在 `src/types.rs`。
 - `ServerCache`（`Voxy / Bobby`）标识缓存种类，`CacheTransfer`（`Copy / LinkToSource / LinkToShared(共享目录)`）表示迁移方式；`MigrationRequest` 的 `voxy`、`bobby` 字段各为 `Option<CacheTransfer>`，`None` 表示不处理。
+- `PackTransfer`（`CopyMissing / LinkToShared(共享目录)`）表示材质包处理方式，对应 `MigrationRequest.resource_packs`；同名冲突以 `PackConflict`（名称、`existing` 与 `incoming` 两个 `PackVersion`：来源、大小、修改时间）交给界面，用户返回 `ConflictChoice`（`KeepExisting / UseIncoming`）。后台线程通过消息把冲突发给界面并阻塞等待回复。
 - `src/test_support.rs` 仅在测试编译时引入，提供测试用临时目录。
 
 ### 开发环境
@@ -122,6 +137,6 @@
   - 目标旁不存在 `<文件>.bak` 时生成该文件，作为最早的原始备份永不覆盖。
   - 已存在 `<文件>.bak` 时生成 `<文件>.<unix秒>.bak`，同一文件仅保留最近 5 份带时间戳的备份。
   - 时间戳使用标准库 `std::time::SystemTime` 生成，不引入 `chrono`。
-  - 例外：地图与路点目录（§2.5）文件数量大，豁免逐文件 `.bak` 备份；同步前必须在日志中列出将被覆盖的文件。Voxy 与 Bobby 缓存目录按 §2.5 整目录重命名备份。
+  - 例外：地图与路点目录（§2.5）文件数量大，豁免逐文件 `.bak` 备份；同步前必须在日志中列出将被覆盖的文件。Voxy 与 Bobby 缓存目录按 §2.5 整目录重命名备份；材质包按 §2.7 移入 `resourcepacks.bak` 或整体重命名备份。
 - **容错防崩**：遇到破损的 `.jar`、格式不规范的 JSON/TOML 时跳过并记录日志，不得触发 `panic!`。
 - **无黑框分发**：发布模式需开启 `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`。
