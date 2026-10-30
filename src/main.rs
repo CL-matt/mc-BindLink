@@ -663,8 +663,8 @@ impl eframe::App for MigratorApp {
         });
         egui::Panel::left("settings")
             .resizable(true)
-            .default_size(480.0)
-            .size_range(400.0..=640.0)
+            .default_size(620.0)
+            .size_range(400.0..=760.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -714,12 +714,16 @@ fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::
         ui.add_space(2.0);
         add_contents(ui);
     });
-    ui.add_space(8.0);
 }
 
+/// 字段标题使用主题的强调文字颜色（浅色主题为黑色），深色主题下仍保持可读。
 fn field_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
-    ui.label(RichText::new(text).small().weak());
+    ui.label(
+        RichText::new(text)
+            .size(14.0)
+            .color(ui.visuals().strong_text_color()),
+    );
 }
 
 fn log_icon(level: LogLevel) -> &'static str {
