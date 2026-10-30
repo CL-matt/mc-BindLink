@@ -37,7 +37,9 @@ const HEADER_ICON_SIZE: f32 = 18.0;
 const HEADER_LOGO_SIZE: f32 = 28.0;
 
 fn main() -> eframe::Result {
+    // run_native 的应用名还用作 eframe 的设置存储标识，版本号只放在窗口标题中，避免升级后丢失窗口布局
     let mut viewport = egui::ViewportBuilder::default()
+        .with_title(format!("{APP_NAME} v{APP_VERSION}"))
         .with_inner_size([1080.0, 720.0])
         .with_min_inner_size([820.0, 560.0]);
     // 窗口创建前还没有日志区，图标解码失败的原因留到界面启动后写入日志
@@ -435,7 +437,6 @@ impl MigratorApp {
                 );
             }
             ui.label(RichText::new(APP_NAME).size(20.0).strong());
-            ui.label(RichText::new(format!("v{APP_VERSION}")).small().weak());
             ui.label(RichText::new("把按键、配置、地图与缓存迁移到新实例").weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 egui::widgets::global_theme_preference_buttons(ui);
