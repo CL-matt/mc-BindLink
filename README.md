@@ -4,6 +4,10 @@
 
 BindLink（键链）是一个 Windows 桌面工具，把一个 Minecraft 实例里的按键、选项、Mod 配置、地图路点、Voxy 与 Bobby 缓存迁移到另一个实例。换整合包、升级版本或拿到朋友的客户端时，不用再手动重设几十个按键。
 
+## 下载
+
+在 [Releases](https://github.com/CL-matt/mc-bindsync/releases) 页面下载最新版本的 `bindlink.exe`，无需安装，双击即可运行。
+
 ## 功能
 
 - **实例发现**：自动扫描程序所在目录及其上级目录中的 `.minecraft`，也可以手动添加目录。识别 `versions/<名称>/` 下的版本隔离实例，并标注由 PCL2 创建的实例。
@@ -27,8 +31,7 @@ BindLink（键链）是一个 Windows 桌面工具，把一个 Minecraft 实例�
 
 ### 迁移步骤
 
-界面左侧是按"实例 / 固定配置 / 按键与配置 / 地图与缓存 / 材质包与蓝图"分组的选项，右侧是日志，两者之间的分隔线可以拖动调整宽度。右上角可以切换"跟随系统 / 浅色 / 深色"主题，旁边的 GitHub 与 LorianTool 按钮会在浏览器中打开项目仓库和 LorianTool 网站。
-
+界面左侧是按"实例 / 固定配置 / 按键与配置 / 地图与缓存 / 材质包与蓝图"分组的选项，右侧是日志，两者之间的分隔线可以拖动调整宽度。
 
 1. **选择实例**：在"模板实例"中选择配置好的旧实例，在"目标实例"中选择要写入的新实例。鼠标悬停在选项上可以看到实例的完整路径。实例名后的"隔离"表示版本隔离实例，"根目录"表示 `.minecraft` 本身的共享配置。
 2. **（可选）使用固定配置**：左侧"固定配置"卡片中的按钮可以一次填好下面的选项，填好后仍可逐项修改：
@@ -99,3 +102,11 @@ cargo build --release
 | `logos/` | 软件标志 `bindlink.svg` 与其 256 px PNG 版本（窗口图标与标题栏使用），以及 LorianTool 图标；PNG 编译时嵌入程序 |
 | `todolist.md` | 待实现功能 |
 | `CLAUDE.md`、`docs/` | 开发规范 |
+
+## 问题反馈
+
+使用中遇到问题或有功能建议，请在 [Issues](https://github.com/CL-matt/mc-bindsync/issues) 中提交，并附上日志区的相关内容。
+
+## 相关项目
+
+- [PCL2](https://github.com/Meloong-Git/PCL)：Plain Craft Launcher 2，BindLink 目前适配的 Minecraft 启动器。
