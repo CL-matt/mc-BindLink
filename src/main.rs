@@ -79,6 +79,26 @@ impl CacheChoice {
     }
 }
 
+/// 一键填充同步内容的固定配置，只修改界面选项，用户仍可在应用后逐项调整。
+struct Preset {
+    name: &'static str,
+    mode: SyncMode,
+    cache_choice: CacheChoice,
+}
+
+const PRESETS: &[Preset] = &[
+    Preset {
+        name: "洛林",
+        mode: SyncMode::Merge,
+        cache_choice: CacheChoice::Copy,
+    },
+    Preset {
+        name: "neko喵喵喵",
+        mode: SyncMode::FullOverwrite,
+        cache_choice: CacheChoice::LinkToShared,
+    },
+];
+
 struct MigratorApp {
     selected_dirs: Vec<PathBuf>,
     instances: Vec<DetectedInstance>,
@@ -265,6 +285,27 @@ impl MigratorApp {
             });
     }
 
+    fn apply_preset(&mut self, preset: &Preset) {
+        self.mode = preset.mode;
+        self.sync_options = true;
+        self.sync_mod_configs = true;
+        self.sync_maps = true;
+        self.voxy_choice = preset.cache_choice;
+        self.bobby_choice = preset.cache_choice;
+        self.logs.push(format!("已应用固定配置：{}", preset.name));
+    }
+
+    fn show_preset_section(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("固定配置");
+            for preset in PRESETS {
+                if ui.button(preset.name).clicked() {
+                    self.apply_preset(preset);
+                }
+            }
+        });
+    }
+
     fn show_content_section(&mut self, ui: &mut egui::Ui) {
         ui.checkbox(&mut self.sync_options, "按键与选项（options.txt）");
         ui.checkbox(&mut self.sync_mod_configs, "Mod 独立配置（Axiom 等）");
@@ -328,6 +369,7 @@ impl eframe::App for MigratorApp {
                 ui.heading("实例");
                 self.show_instance_section(ui);
                 ui.separator();
+                self.show_preset_section(ui);
                 ui.heading("同步内容");
                 self.show_content_section(ui);
                 ui.separator();
