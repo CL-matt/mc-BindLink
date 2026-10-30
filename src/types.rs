@@ -154,6 +154,65 @@ pub enum ConflictChoice {
     UseIncoming,
 }
 
+/// 日志级别，界面据此选择颜色与图标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    /// 进度与中性信息。
+    Info,
+    /// 有意未执行的操作，例如内容相同无需修改、条件不满足而跳过。
+    Skip,
+    /// 已写入、复制或建立链接。
+    Success,
+    /// 单个条目失败，不影响同一步骤的其他条目。
+    Warning,
+    /// 整个步骤失败。
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntry {
+    pub level: LogLevel,
+    pub message: String,
+}
+
+/// 业务模块输出日志的统一入口，把带级别的条目交给调用方提供的回调。
+pub struct LogSink<'a> {
+    emit: &'a mut dyn FnMut(LogEntry),
+}
+
+impl<'a> LogSink<'a> {
+    pub fn new(emit: &'a mut dyn FnMut(LogEntry)) -> Self {
+        Self { emit }
+    }
+
+    pub fn write(&mut self, level: LogLevel, message: impl Into<String>) {
+        (self.emit)(LogEntry {
+            level,
+            message: message.into(),
+        });
+    }
+
+    pub fn info(&mut self, message: impl Into<String>) {
+        self.write(LogLevel::Info, message);
+    }
+
+    pub fn skip(&mut self, message: impl Into<String>) {
+        self.write(LogLevel::Skip, message);
+    }
+
+    pub fn success(&mut self, message: impl Into<String>) {
+        self.write(LogLevel::Success, message);
+    }
+
+    pub fn warn(&mut self, message: impl Into<String>) {
+        self.write(LogLevel::Warning, message);
+    }
+
+    pub fn error(&mut self, message: impl Into<String>) {
+        self.write(LogLevel::Error, message);
+    }
+}
+
 /// 一次迁移的执行结果，供界面汇总展示。
 #[derive(Debug, Default)]
 pub struct MigrationResult {

@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use walkdir::WalkDir;
 
-use crate::types::{CacheTransfer, MigrationResult, ServerCache};
+use crate::types::{CacheTransfer, LogSink, MigrationResult, ServerCache};
 
 /// 以世界键（单人存档名或 `Multiplayer_<服务器地址>`）为子目录的地图与路点根目录。
 const MAP_ROOTS: &[&str] = &[
@@ -29,7 +29,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub fn sync_map_directories(
     template_dir: &Path,
     target_dir: &Path,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
 ) -> Result<MigrationResult> {
     let mut plan = Vec::new();
     for root in MAP_ROOTS {
@@ -54,17 +54,17 @@ pub fn sync_map_directories(
 
     let mut result = MigrationResult::default();
     if plan.is_empty() {
-        log("地图与路点：目标已是最新，无需同步".to_string());
+        log.skip("地图与路点：目标已是最新，无需同步".to_string());
         return Ok(result);
     }
     let overwrites: Vec<&CopyItem> = plan.iter().filter(|item| item.overwrites).collect();
     if !overwrites.is_empty() {
-        log(format!(
+        log.info(format!(
             "地图与路点：以下 {} 个文件将被模板中更新的版本覆盖",
             overwrites.len()
         ));
         for item in &overwrites {
-            log(format!("  {}", item.destination.display()));
+            log.info(format!("  {}", item.destination.display()));
         }
     }
     let overwrite_count = overwrites.len();
@@ -83,7 +83,7 @@ pub fn sync_map_directories(
         })?;
         result.changed_paths.push(item.destination);
     }
-    log(format!(
+    log.success(format!(
         "地图与路点：复制 {} 个文件，其中覆盖 {} 个",
         result.changed_paths.len(),
         overwrite_count
@@ -152,12 +152,12 @@ pub fn transfer_server_caches(
     template_dir: &Path,
     target_dir: &Path,
     method: &CacheTransfer,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
 ) -> Result<MigrationResult> {
     let mut result = MigrationResult::default();
     let source_root = template_dir.join(cache_root(kind));
     if !source_root.is_dir() {
-        log(format!("{kind}：模板实例没有缓存目录，跳过"));
+        log.skip(format!("{kind}：模板实例没有缓存目录，跳过"));
         return Ok(result);
     }
     let target_root = target_dir.join(cache_root(kind));
@@ -179,7 +179,7 @@ pub fn transfer_server_caches(
             Ok(false) => {}
             Err(err) => {
                 let message = format!("{kind}：迁移 {} 失败：{err:#}", name.to_string_lossy());
-                log(message.clone());
+                log.warn(message.clone());
                 result.warnings.push(message);
             }
         }
@@ -193,11 +193,11 @@ fn transfer_one_cache(
     source: &Path,
     target: &Path,
     method: &CacheTransfer,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
 ) -> Result<bool> {
     let real_source = resolve_real_path(source)?;
     if target.exists() && resolve_real_path(target)? == real_source {
-        log(format!("{kind}：{} 已与源共用缓存，跳过", target.display()));
+        log.skip(format!("{kind}：{} 已与源共用缓存，跳过", target.display()));
         return Ok(false);
     }
 
@@ -219,7 +219,7 @@ fn transfer_one_cache(
     if target.exists() {
         ensure_cache_not_in_use(target)?;
         let backup = rename_aside(target)?;
-        log(format!(
+        log.info(format!(
             "{kind}：已将目标原有缓存重命名为 {}",
             backup.display()
         ));
@@ -228,7 +228,7 @@ fn transfer_one_cache(
     match link_destination {
         Some(destination) => {
             create_junction(target, &destination)?;
-            log(format!(
+            log.success(format!(
                 "{kind}：{} → {}",
                 target.display(),
                 destination.display()
@@ -236,7 +236,7 @@ fn transfer_one_cache(
         }
         None => {
             copy_dir_recursive(&real_source, target)?;
-            log(format!("{kind}：已复制 {}", target.display()));
+            log.success(format!("{kind}：已复制 {}", target.display()));
         }
     }
     Ok(true)
@@ -248,7 +248,7 @@ fn prepare_shared_cache(
     source: &Path,
     real_source: &Path,
     shared_root: &Path,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
 ) -> Result<PathBuf> {
     let name = source
         .file_name()
@@ -283,7 +283,7 @@ fn prepare_shared_cache(
         })?;
         return Err(err);
     }
-    log(format!(
+    log.success(format!(
         "{kind}：已将源缓存移动到 {} 并在源实例建立链接",
         shared.display()
     ));
@@ -421,10 +421,6 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    fn no_log() -> impl FnMut(String) {
-        |_| {}
-    }
-
     fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
         File::options().write(true).open(path)?.set_modified(time)?;
         Ok(())
@@ -454,7 +450,11 @@ mod tests {
         fs::write(source_world.join("extra.txt"), "added")?;
         fs::write(target_world.join("mine.txt"), "kept")?;
 
-        let result = sync_map_directories(template.path(), target.path(), &mut no_log())?;
+        let result = sync_map_directories(
+            template.path(),
+            target.path(),
+            &mut LogSink::new(&mut |_| {}),
+        )?;
 
         assert_eq!(result.changed_paths.len(), 2);
         assert_eq!(
@@ -503,7 +503,7 @@ mod tests {
             template.path(),
             target.path(),
             &CacheTransfer::Copy,
-            &mut no_log(),
+            &mut LogSink::new(&mut |_| {}),
         )?;
 
         assert_eq!(result.changed_paths, vec![target_world.clone()]);
@@ -532,7 +532,7 @@ mod tests {
             template.path(),
             target.path(),
             &CacheTransfer::LinkToSource,
-            &mut no_log(),
+            &mut LogSink::new(&mut |_| {}),
         )?;
 
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
@@ -559,7 +559,7 @@ mod tests {
                 template.path(),
                 target_dir,
                 &method,
-                &mut no_log(),
+                &mut LogSink::new(&mut |_| {}),
             )
         };
 
@@ -601,7 +601,7 @@ mod tests {
                 template.path(),
                 target.path(),
                 &method,
-                &mut no_log(),
+                &mut LogSink::new(&mut |_| {}),
             )?;
             assert!(result.warnings.is_empty(), "{kind}: {:?}", result.warnings);
         }
@@ -639,7 +639,7 @@ mod tests {
             template.path(),
             target.path(),
             &CacheTransfer::Copy,
-            &mut no_log(),
+            &mut LogSink::new(&mut |_| {}),
         )?;
 
         assert!(result.changed_paths.is_empty());
@@ -664,7 +664,7 @@ mod tests {
             template.path(),
             target.path(),
             &CacheTransfer::Copy,
-            &mut no_log(),
+            &mut LogSink::new(&mut |_| {}),
         )?;
 
         assert!(result.changed_paths.is_empty());

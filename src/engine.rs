@@ -13,7 +13,7 @@ use zip::result::ZipError;
 use crate::map_sync;
 use crate::pack_sync::{self, ConflictResolver};
 use crate::types::{
-    MigrationRequest, MigrationResult, PackTransfer, ServerCache, SharedAsset, SyncMode,
+    LogSink, MigrationRequest, MigrationResult, PackTransfer, ServerCache, SharedAsset, SyncMode,
 };
 
 const OPTIONS_FILE_NAME: &str = "options.txt";
@@ -60,14 +60,14 @@ const MOD_CONFIG_RULES: &[ModConfigRule] = &[ModConfigRule {
 pub fn run_migration(
     request: &MigrationRequest,
     resolve: &mut ConflictResolver,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
 ) -> Result<MigrationResult> {
     let template_dir = &request.template.game_dir;
     let target_dir = &request.target.game_dir;
     if template_dir == target_dir {
         bail!("模板实例与目标实例是同一个目录：{}", template_dir.display());
     }
-    log(format!(
+    log.info(format!(
         "开始迁移：{} → {}",
         request.template, request.target
     ));
@@ -121,7 +121,7 @@ pub fn run_migration(
         record_step_failure("Axiom 蓝图同步", outcome, log, &mut result);
     }
 
-    log(format!(
+    log.info(format!(
         "迁移结束：修改 {} 处，警告 {} 条",
         result.changed_paths.len(),
         result.warnings.len()
@@ -132,12 +132,12 @@ pub fn run_migration(
 fn record_step_failure(
     step: &str,
     outcome: Result<()>,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
     result: &mut MigrationResult,
 ) {
     if let Err(err) = outcome {
         let message = format!("{step}失败：{err:#}");
-        log(message.clone());
+        log.error(message.clone());
         result.warnings.push(message);
     }
 }
@@ -308,14 +308,14 @@ fn apply_options_mapping(
     template: &OptionsFile,
     target: &mut OptionsFile,
     mode: SyncMode,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
 ) -> usize {
     let key_format_mismatch = matches!(
         (template.uses_legacy_key_codes(), target.uses_legacy_key_codes()),
         (Some(a), Some(b)) if a != b
     );
     if key_format_mismatch {
-        log("模板与目标分处 1.13 两侧，按键格式不兼容，已跳过全部 key_ 条目".to_string());
+        log.warn("模板与目标分处 1.13 两侧，按键格式不兼容，已跳过全部 key_ 条目".to_string());
     }
 
     let mut changed = 0;
@@ -339,7 +339,7 @@ fn sync_options_file(
     template_dir: &Path,
     target_dir: &Path,
     mode: SyncMode,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
     let template_path = template_dir.join(OPTIONS_FILE_NAME);
@@ -353,7 +353,7 @@ fn sync_options_file(
             "目标实例尚未生成 {}，请先启动一次游戏再迁移",
             target_path.display()
         );
-        log(message.clone());
+        log.warn(message.clone());
         result.warnings.push(message);
         return Ok(());
     }
@@ -362,16 +362,16 @@ fn sync_options_file(
     let mut target = OptionsFile::load(&target_path)?;
     let changed = apply_options_mapping(&template, &mut target, mode, log);
     if changed == 0 {
-        log("options.txt：与模板一致，无需修改".to_string());
+        log.skip("options.txt：与模板一致，无需修改".to_string());
         return Ok(());
     }
 
     if let Some(backup) = backup_file_safely(&target_path)? {
-        log(format!("已备份到 {}", backup.display()));
+        log.info(format!("已备份到 {}", backup.display()));
     }
     fs::write(&target_path, target.to_text())
         .with_context(|| format!("写入 {} 失败", target_path.display()))?;
-    log(format!("options.txt：更新 {changed} 个条目"));
+    log.success(format!("options.txt：更新 {changed} 个条目"));
     result.changed_paths.push(target_path);
     Ok(())
 }
@@ -380,13 +380,13 @@ fn sync_options_file(
 fn sync_enabled_pack_list(
     template_dir: &Path,
     target_dir: &Path,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
     let template_path = template_dir.join(OPTIONS_FILE_NAME);
     let target_path = target_dir.join(OPTIONS_FILE_NAME);
     if !template_path.is_file() || !target_path.is_file() {
-        log("材质包启用列表：模板或目标缺少 options.txt，跳过".to_string());
+        log.skip("材质包启用列表：模板或目标缺少 options.txt，跳过".to_string());
         return Ok(());
     }
     let template = OptionsFile::load(&template_path)?;
@@ -400,15 +400,15 @@ fn sync_enabled_pack_list(
         }
     }
     if changed == 0 {
-        log("材质包启用列表：与模板一致，无需修改".to_string());
+        log.skip("材质包启用列表：与模板一致，无需修改".to_string());
         return Ok(());
     }
     if let Some(backup) = backup_file_safely(&target_path)? {
-        log(format!("已备份到 {}", backup.display()));
+        log.info(format!("已备份到 {}", backup.display()));
     }
     fs::write(&target_path, target.to_text())
         .with_context(|| format!("写入 {} 失败", target_path.display()))?;
-    log("材质包启用列表：已按模板更新".to_string());
+    log.success("材质包启用列表：已按模板更新".to_string());
     result.changed_paths.push(target_path);
     Ok(())
 }
@@ -421,14 +421,14 @@ fn sync_axiom_blueprints(
     request: &MigrationRequest,
     method: &PackTransfer,
     resolve: &mut ConflictResolver,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
     let template_dir = &request.template.game_dir;
     let target_dir = &request.target.game_dir;
     let installed = detect_installed_mod_ids(&target_dir.join("mods"), log)?;
     if !installed.contains(AXIOM_MOD_ID) {
-        log("Axiom 蓝图：目标实例未安装 Axiom，跳过".to_string());
+        log.skip("Axiom 蓝图：目标实例未安装 Axiom，跳过".to_string());
         return Ok(());
     }
     let target_version = read_data_version(target_dir)?;
@@ -502,7 +502,7 @@ fn append_blueprint_ordering(
     dir: &Path,
     names: &[String],
     template_order: &[String],
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
     let mut ordering = read_blueprint_ordering(dir)?;
@@ -526,11 +526,11 @@ fn append_blueprint_ordering(
 
     let path = dir.join(BLUEPRINT_ORDERING_FILE);
     if let Some(backup) = backup_file_safely(&path)? {
-        log(format!("已备份到 {}", backup.display()));
+        log.info(format!("已备份到 {}", backup.display()));
     }
     let text: String = ordering.iter().map(|name| format!("{name}\n")).collect();
     fs::write(&path, text).with_context(|| format!("写入 {} 失败", path.display()))?;
-    log(format!("Axiom 蓝图：已更新排序文件 {}", path.display()));
+    log.success(format!("Axiom 蓝图：已更新排序文件 {}", path.display()));
     result.changed_paths.push(path);
     Ok(())
 }
@@ -538,10 +538,7 @@ fn append_blueprint_ordering(
 /// 读取 `mods_dir` 下所有 `.jar` 的元数据并返回 Mod ID 集合。
 ///
 /// 损坏的压缩包与不规范的元数据只记录日志并跳过，不会中断扫描。
-pub fn detect_installed_mod_ids(
-    mods_dir: &Path,
-    log: &mut dyn FnMut(String),
-) -> Result<HashSet<String>> {
+pub fn detect_installed_mod_ids(mods_dir: &Path, log: &mut LogSink) -> Result<HashSet<String>> {
     let mut ids = HashSet::new();
     if !mods_dir.is_dir() {
         return Ok(ids);
@@ -552,7 +549,7 @@ pub fn detect_installed_mod_ids(
         let path = match entry {
             Ok(entry) => entry.path(),
             Err(err) => {
-                log(format!("跳过无法读取的目录项：{err}"));
+                log.warn(format!("跳过无法读取的目录项：{err}"));
                 continue;
             }
         };
@@ -564,10 +561,10 @@ pub fn detect_installed_mod_ids(
         }
         match read_mod_ids_from_jar(&path) {
             Ok(found) if found.is_empty() => {
-                log(format!("未在 {} 中找到 Mod 元数据", path.display()));
+                log.skip(format!("未在 {} 中找到 Mod 元数据", path.display()));
             }
             Ok(found) => ids.extend(found),
-            Err(err) => log(format!(
+            Err(err) => log.warn(format!(
                 "跳过无法解析的 Mod 文件 {}：{err:#}",
                 path.display()
             )),
@@ -642,11 +639,11 @@ fn sync_mod_configs(
     template_dir: &Path,
     target_dir: &Path,
     mode: SyncMode,
-    log: &mut dyn FnMut(String),
+    log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
     let installed = detect_installed_mod_ids(&target_dir.join("mods"), log)?;
-    log(format!("目标实例识别到 {} 个 Mod", installed.len()));
+    log.info(format!("目标实例识别到 {} 个 Mod", installed.len()));
 
     for rule in MOD_CONFIG_RULES {
         if !installed.contains(rule.mod_id) {
@@ -654,7 +651,7 @@ fn sync_mod_configs(
         }
         let source = template_dir.join(rule.relative_path);
         if !source.is_file() {
-            log(format!(
+            log.skip(format!(
                 "{}：模板实例没有 {}，跳过",
                 rule.mod_id, rule.relative_path
             ));
@@ -663,13 +660,13 @@ fn sync_mod_configs(
         let destination = target_dir.join(rule.relative_path);
         match apply_mod_config_rule(rule, &source, &destination, mode) {
             Ok(true) => {
-                log(format!("{}：已更新 {}", rule.mod_id, rule.relative_path));
+                log.success(format!("{}：已更新 {}", rule.mod_id, rule.relative_path));
                 result.changed_paths.push(destination);
             }
-            Ok(false) => log(format!("{}：与模板一致，无需修改", rule.mod_id)),
+            Ok(false) => log.skip(format!("{}：与模板一致，无需修改", rule.mod_id)),
             Err(err) => {
                 let message = format!("{}：同步 {} 失败：{err:#}", rule.mod_id, rule.relative_path);
-                log(message.clone());
+                log.warn(message.clone());
                 result.warnings.push(message);
             }
         }
@@ -732,10 +729,6 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    fn no_log() -> impl FnMut(String) {
-        |_| {}
-    }
-
     #[test]
     fn merge_overwrites_and_appends_key_bindings_only() {
         let template = OptionsFile::parse(
@@ -745,7 +738,12 @@ mod tests {
             "version:3955\r\nfov:0.0\r\nkey_key.jump:key.keyboard.j\r\nkey_key.only.target:key.keyboard.x\r\n",
         );
 
-        let changed = apply_options_mapping(&template, &mut target, SyncMode::Merge, &mut no_log());
+        let changed = apply_options_mapping(
+            &template,
+            &mut target,
+            SyncMode::Merge,
+            &mut LogSink::new(&mut |_| {}),
+        );
 
         assert_eq!(changed, 2);
         assert_eq!(
@@ -768,7 +766,7 @@ mod tests {
             &template,
             &mut target,
             SyncMode::FullOverwrite,
-            &mut no_log(),
+            &mut LogSink::new(&mut |_| {}),
         );
 
         assert_eq!(target.get("renderDistance"), Some("32"));
@@ -788,7 +786,7 @@ mod tests {
             &template,
             &mut target,
             SyncMode::FullOverwrite,
-            &mut no_log(),
+            &mut LogSink::new(&mut |_| {}),
         );
 
         assert_eq!(changed, 1);
@@ -846,7 +844,7 @@ mod tests {
             template.path(),
             target.path(),
             SyncMode::Merge,
-            &mut no_log(),
+            &mut LogSink::new(&mut |_| {}),
             &mut result,
         )?;
 
@@ -876,7 +874,7 @@ mod tests {
             template.path(),
             target.path(),
             SyncMode::Merge,
-            &mut no_log(),
+            &mut LogSink::new(&mut |_| {}),
             &mut result,
         )?;
 
@@ -920,7 +918,10 @@ mod tests {
         )?;
 
         let mut messages = Vec::new();
-        let ids = detect_installed_mod_ids(dir.path(), &mut |m| messages.push(m))?;
+        let ids = detect_installed_mod_ids(
+            dir.path(),
+            &mut LogSink::new(&mut |entry| messages.push(entry)),
+        )?;
 
         assert_eq!(
             ids,
@@ -986,7 +987,7 @@ mod tests {
             dir.path(),
             &names,
             &template_order,
-            &mut no_log(),
+            &mut LogSink::new(&mut |_| {}),
             &mut result,
         )?;
 
@@ -1012,7 +1013,12 @@ mod tests {
         )?;
 
         let mut result = MigrationResult::default();
-        sync_enabled_pack_list(template.path(), target.path(), &mut no_log(), &mut result)?;
+        sync_enabled_pack_list(
+            template.path(),
+            target.path(),
+            &mut LogSink::new(&mut |_| {}),
+            &mut result,
+        )?;
 
         let updated = OptionsFile::load(&target.path().join("options.txt"))?;
         assert_eq!(

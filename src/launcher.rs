@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::types::{DetectedInstance, LauncherKind};
+use crate::types::{DetectedInstance, LauncherKind, LogSink};
 
 const MINECRAFT_DIR_NAME: &str = ".minecraft";
 const VERSIONS_DIR_NAME: &str = "versions";
@@ -12,27 +12,24 @@ const VERSIONS_DIR_NAME: &str = "versions";
 /// 从用户选择的目录与程序工作目录及其父级的 `.minecraft` 中发现全部实例。
 ///
 /// 单个 `.minecraft` 读取失败时只记录日志，不影响其他目录的扫描结果。
-pub fn scan_all_instances(
-    selected_dirs: &[PathBuf],
-    log: &mut dyn FnMut(String),
-) -> Vec<DetectedInstance> {
+pub fn scan_all_instances(selected_dirs: &[PathBuf], log: &mut LogSink) -> Vec<DetectedInstance> {
     let mut instances = Vec::new();
     for root in collect_minecraft_roots(selected_dirs, log) {
         match scan_minecraft_root(&root) {
             Ok(found) => instances.extend(found),
-            Err(err) => log(format!("扫描 {} 失败：{err:#}", root.display())),
+            Err(err) => log.warn(format!("扫描 {} 失败：{err:#}", root.display())),
         }
     }
-    log(format!("共发现 {} 个实例", instances.len()));
+    log.info(format!("共发现 {} 个实例", instances.len()));
     instances
 }
 
-fn collect_minecraft_roots(selected_dirs: &[PathBuf], log: &mut dyn FnMut(String)) -> Vec<PathBuf> {
+fn collect_minecraft_roots(selected_dirs: &[PathBuf], log: &mut LogSink) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     for dir in selected_dirs {
         match resolve_minecraft_root(dir) {
             Some(root) => candidates.push(root),
-            None => log(format!("所选目录 {} 中未找到 .minecraft", dir.display())),
+            None => log.warn(format!("所选目录 {} 中未找到 .minecraft", dir.display())),
         }
     }
     match env::current_dir() {
@@ -41,7 +38,7 @@ fn collect_minecraft_roots(selected_dirs: &[PathBuf], log: &mut dyn FnMut(String
                 .map(|dir| dir.join(MINECRAFT_DIR_NAME))
                 .filter(|dir| dir.join(VERSIONS_DIR_NAME).is_dir()),
         ),
-        Err(err) => log(format!("无法读取程序工作目录：{err}")),
+        Err(err) => log.warn(format!("无法读取程序工作目录：{err}")),
     }
 
     let mut roots: Vec<PathBuf> = Vec::new();

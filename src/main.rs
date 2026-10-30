@@ -17,20 +17,21 @@ use std::thread;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
-use eframe::egui;
+use eframe::egui::{self, Color32, RichText};
 
 use crate::types::{
-    CacheTransfer, ConflictChoice, DetectedInstance, MigrationRequest, MigrationResult,
-    PackConflict, PackTransfer, PackVersion, ServerCache, SharedAsset, SyncMode,
+    CacheTransfer, ConflictChoice, DetectedInstance, LogEntry, LogLevel, LogSink, MigrationRequest,
+    MigrationResult, PackConflict, PackTransfer, PackVersion, ServerCache, SharedAsset, SyncMode,
 };
 
 const CJK_FONT_NAME: &str = "msyh";
+const ACCENT: Color32 = Color32::from_rgb(76, 145, 98);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 680.0])
-            .with_min_inner_size([560.0, 480.0]),
+            .with_inner_size([1080.0, 720.0])
+            .with_min_inner_size([820.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -41,7 +42,7 @@ fn main() -> eframe::Result {
 }
 
 enum WorkerMessage {
-    Log(String),
+    Log(LogEntry),
     /// 后台线程遇到材质包或蓝图同名冲突，阻塞等待界面通过附带的发送端回传用户选择。
     Conflicts(Vec<PackConflict>, Sender<Vec<ConflictChoice>>),
     Finished(Result<MigrationResult>),
@@ -151,6 +152,14 @@ const PRESETS: &[Preset] = &[
     },
 ];
 
+/// 底部状态栏显示的最近一次迁移结果。
+enum RunStatus {
+    Idle,
+    Running,
+    Finished { warnings: usize },
+    Failed,
+}
+
 struct MigratorApp {
     selected_dirs: Vec<PathBuf>,
     instances: Vec<DetectedInstance>,
@@ -165,7 +174,8 @@ struct MigratorApp {
     pack_choice: PackChoice,
     blueprint_choice: PackChoice,
     shared_dir: Option<PathBuf>,
-    logs: Vec<String>,
+    logs: Vec<LogEntry>,
+    status: RunStatus,
     worker: Option<Receiver<WorkerMessage>>,
     conflict_dialog: Option<ConflictDialog>,
 }
@@ -187,22 +197,35 @@ impl MigratorApp {
             blueprint_choice: PackChoice::Skip,
             shared_dir: None,
             logs: Vec::new(),
+            status: RunStatus::Idle,
             worker: None,
             conflict_dialog: None,
         };
+        apply_style(ctx);
         if let Err(err) = install_cjk_font(ctx) {
-            app.logs
-                .push(format!("加载中文字体失败，界面文字可能无法显示：{err:#}"));
+            app.push_log(
+                LogLevel::Warning,
+                format!("加载中文字体失败，界面文字可能无法显示：{err:#}"),
+            );
         }
         app.rescan_instances();
         app
     }
 
+    fn push_log(&mut self, level: LogLevel, message: impl Into<String>) {
+        self.logs.push(LogEntry {
+            level,
+            message: message.into(),
+        });
+    }
+
     fn rescan_instances(&mut self) {
-        let mut messages = Vec::new();
-        let instances =
-            launcher::scan_all_instances(&self.selected_dirs, &mut |m| messages.push(m));
-        self.logs.extend(messages);
+        let mut entries = Vec::new();
+        let instances = launcher::scan_all_instances(
+            &self.selected_dirs,
+            &mut LogSink::new(&mut |entry| entries.push(entry)),
+        );
+        self.logs.extend(entries);
 
         let template = self.selected_instance(self.template_index).cloned();
         let target = self.selected_instance(self.target_index).cloned();
@@ -217,6 +240,11 @@ impl MigratorApp {
 
     fn is_running(&self) -> bool {
         self.worker.is_some()
+    }
+
+    fn needs_shared_dir(&self) -> bool {
+        [self.voxy_choice, self.bobby_choice].contains(&CacheChoice::LinkToShared)
+            || [self.pack_choice, self.blueprint_choice].contains(&PackChoice::LinkToShared)
     }
 
     fn build_request(&self) -> Result<MigrationRequest, String> {
@@ -261,7 +289,7 @@ impl MigratorApp {
         let request = match self.build_request() {
             Ok(request) => request,
             Err(message) => {
-                self.logs.push(message);
+                self.push_log(LogLevel::Error, message);
                 return;
             }
         };
@@ -270,35 +298,38 @@ impl MigratorApp {
         // 复制 Voxy 或 Bobby 缓存可能耗时数分钟，放到后台线程以免阻塞界面
         thread::spawn(move || {
             // 发送失败只会发生在窗口关闭、接收端已释放之后，此时没有可写日志的地方
-            let mut log = |message: String| {
-                sender.send(WorkerMessage::Log(message)).ok();
+            let mut emit = |entry: LogEntry| {
+                sender.send(WorkerMessage::Log(entry)).ok();
                 ctx.request_repaint();
             };
             let mut resolve = |conflicts: Vec<PackConflict>| -> Result<Vec<ConflictChoice>> {
                 let (reply, answer) = mpsc::channel();
                 sender
                     .send(WorkerMessage::Conflicts(conflicts, reply))
-                    .map_err(|_| anyhow!("界面已关闭，无法询问材质包冲突的处理方式"))?;
+                    .map_err(|_| anyhow!("界面已关闭，无法询问同名冲突的处理方式"))?;
                 ctx.request_repaint();
                 answer
                     .recv()
-                    .map_err(|_| anyhow!("未收到材质包冲突的处理选择"))
+                    .map_err(|_| anyhow!("未收到同名冲突的处理选择"))
             };
-            let outcome = engine::run_migration(&request, &mut resolve, &mut log);
+            let outcome =
+                engine::run_migration(&request, &mut resolve, &mut LogSink::new(&mut emit));
             sender.send(WorkerMessage::Finished(outcome)).ok();
             ctx.request_repaint();
         });
         self.worker = Some(receiver);
+        self.status = RunStatus::Running;
     }
 
     fn drain_worker_messages(&mut self) {
         let Some(receiver) = &self.worker else {
             return;
         };
-        let mut finished = false;
+        let mut received = Vec::new();
+        let mut finished = None;
         loop {
             match receiver.try_recv() {
-                Ok(WorkerMessage::Log(message)) => self.logs.push(message),
+                Ok(WorkerMessage::Log(entry)) => received.push(entry),
                 Ok(WorkerMessage::Conflicts(conflicts, reply)) => {
                     self.conflict_dialog = Some(ConflictDialog {
                         choices: vec![ConflictChoice::KeepExisting; conflicts.len()],
@@ -307,63 +338,39 @@ impl MigratorApp {
                     });
                 }
                 Ok(WorkerMessage::Finished(outcome)) => {
-                    match outcome {
-                        Ok(result) if result.warnings.is_empty() => {
-                            self.logs.push("迁移完成".to_string());
-                        }
-                        Ok(result) => self.logs.push(format!(
-                            "迁移完成，但有 {} 条警告，请查看上方日志",
-                            result.warnings.len()
-                        )),
-                        Err(err) => self.logs.push(format!("迁移失败：{err:#}")),
-                    }
-                    finished = true;
+                    finished = Some(outcome.map_err(|err| format!("迁移失败：{err:#}")));
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.logs.push("迁移线程意外退出".to_string());
-                    finished = true;
+                    finished = Some(Err("迁移线程意外退出".to_string()));
                     break;
                 }
             }
         }
-        if finished {
-            self.worker = None;
-        }
-    }
-
-    fn show_instance_section(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("重新扫描").clicked() {
-                self.rescan_instances();
+        self.logs.extend(received);
+        let Some(outcome) = finished else {
+            return;
+        };
+        self.worker = None;
+        match outcome {
+            Ok(result) if result.warnings.is_empty() => {
+                self.push_log(LogLevel::Success, "迁移完成");
+                self.status = RunStatus::Finished { warnings: 0 };
             }
-            if ui.button("添加目录…").clicked()
-                && let Some(dir) = rfd::FileDialog::new().pick_folder()
-            {
-                self.selected_dirs.push(dir);
-                self.rescan_instances();
-            }
-        });
-        for dir in &self.selected_dirs {
-            ui.label(format!("已添加：{}", dir.display()));
-        }
-
-        egui::Grid::new("instance_grid")
-            .num_columns(2)
-            .show(ui, |ui| {
-                ui.label("模板实例");
-                show_instance_combo(
-                    ui,
-                    "template_combo",
-                    &self.instances,
-                    &mut self.template_index,
+            Ok(result) => {
+                let warnings = result.warnings.len();
+                self.push_log(
+                    LogLevel::Warning,
+                    format!("迁移完成，但有 {warnings} 条警告，请查看上方日志"),
                 );
-                ui.end_row();
-                ui.label("目标实例");
-                show_instance_combo(ui, "target_combo", &self.instances, &mut self.target_index);
-                ui.end_row();
-            });
+                self.status = RunStatus::Finished { warnings };
+            }
+            Err(message) => {
+                self.push_log(LogLevel::Error, message);
+                self.status = RunStatus::Failed;
+            }
+        }
     }
 
     fn apply_preset(&mut self, preset: &Preset) {
@@ -374,25 +381,71 @@ impl MigratorApp {
         self.voxy_choice = preset.cache_choice;
         self.bobby_choice = preset.cache_choice;
         self.blueprint_choice = PackChoice::Skip;
-        self.logs.push(format!("已应用固定配置：{}", preset.name));
+        self.push_log(LogLevel::Info, format!("已应用固定配置：{}", preset.name));
     }
 
-    fn show_preset_section(&mut self, ui: &mut egui::Ui) {
+    fn show_header(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("固定配置");
-            for preset in PRESETS {
-                if ui.button(preset.name).clicked() {
-                    self.apply_preset(preset);
-                }
-            }
+            ui.label(RichText::new("MC 按键与配置迁移").size(20.0).strong());
+            ui.label(RichText::new("把按键、配置、地图与缓存迁移到新实例").weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::widgets::global_theme_preference_buttons(ui);
+            });
         });
     }
 
-    fn show_content_section(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.sync_options, "按键与选项（options.txt）");
-        ui.checkbox(&mut self.sync_mod_configs, "Mod 独立配置（Axiom 等）");
-        ui.horizontal(|ui| {
-            ui.label("同步模式");
+    fn show_settings(&mut self, ui: &mut egui::Ui) {
+        section(ui, "实例", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("🔄 重新扫描").clicked() {
+                    self.rescan_instances();
+                }
+                if ui.button("📂 添加目录…").clicked()
+                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.selected_dirs.push(dir);
+                    self.rescan_instances();
+                }
+                ui.label(RichText::new(format!("共 {} 个实例", self.instances.len())).weak());
+            });
+            for dir in &self.selected_dirs {
+                ui.label(
+                    RichText::new(format!("已添加：{}", dir.display()))
+                        .weak()
+                        .small(),
+                );
+            }
+            ui.add_space(4.0);
+            field_label(ui, "模板实例（从这里读取）");
+            show_instance_combo(
+                ui,
+                "template_combo",
+                &self.instances,
+                &mut self.template_index,
+            );
+            field_label(ui, "目标实例（写入到这里）");
+            show_instance_combo(ui, "target_combo", &self.instances, &mut self.target_index);
+        });
+
+        section(ui, "固定配置", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for preset in PRESETS {
+                    if ui.button(preset.name).clicked() {
+                        self.apply_preset(preset);
+                    }
+                }
+            });
+            ui.label(
+                RichText::new("点击后填好下方选项，仍可逐项修改")
+                    .weak()
+                    .small(),
+            );
+        });
+
+        section(ui, "按键与配置", |ui| {
+            ui.checkbox(&mut self.sync_options, "按键与选项（options.txt）");
+            ui.checkbox(&mut self.sync_mod_configs, "Mod 独立配置（Axiom 等）");
+            field_label(ui, "同步模式");
             ui.radio_value(&mut self.mode, SyncMode::Merge, "局部合并：只同步按键");
             ui.radio_value(
                 &mut self.mode,
@@ -400,42 +453,144 @@ impl MigratorApp {
                 "全量覆写：以模板为准",
             );
         });
-        ui.checkbox(&mut self.sync_maps, "地图与路点（Xaero）");
 
-        egui::Grid::new("cache_grid").num_columns(2).show(ui, |ui| {
+        section(ui, "地图与缓存", |ui| {
+            ui.checkbox(&mut self.sync_maps, "地图与路点（Xaero）");
             for (kind, choice) in [
                 (ServerCache::Voxy, &mut self.voxy_choice),
                 (ServerCache::Bobby, &mut self.bobby_choice),
             ] {
-                ui.label(format!("{kind} 缓存"));
+                field_label(ui, &format!("{kind} 缓存"));
                 show_cache_combo(ui, kind, choice);
-                ui.end_row();
             }
+        });
+
+        section(ui, "材质包与蓝图", |ui| {
             for (kind, choice) in [
                 (SharedAsset::ResourcePacks, &mut self.pack_choice),
                 (SharedAsset::AxiomBlueprints, &mut self.blueprint_choice),
             ] {
-                ui.label(kind.to_string());
+                field_label(ui, &kind.to_string());
                 show_pack_combo(ui, kind, choice);
-                ui.end_row();
             }
         });
-        let needs_shared_dir = [self.voxy_choice, self.bobby_choice]
-            .contains(&CacheChoice::LinkToShared)
-            || [self.pack_choice, self.blueprint_choice].contains(&PackChoice::LinkToShared);
-        if needs_shared_dir {
-            ui.horizontal(|ui| {
-                if ui.button("选择共享目录…").clicked()
+
+        if self.needs_shared_dir() {
+            section(ui, "共享目录", |ui| {
+                match &self.shared_dir {
+                    Some(dir) => ui.label(dir.display().to_string()),
+                    None => ui.label(
+                        RichText::new("尚未选择，使用 Junction 指向共享目录前必须先选择")
+                            .color(ui.visuals().warn_fg_color),
+                    ),
+                };
+                if ui.button("📂 选择共享目录…").clicked()
                     && let Some(dir) = rfd::FileDialog::new().pick_folder()
                 {
                     self.shared_dir = Some(dir);
                 }
-                match &self.shared_dir {
-                    Some(dir) => ui.label(dir.display().to_string()),
-                    None => ui.label("尚未选择"),
-                };
             });
         }
+    }
+
+    fn show_action_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            match self.status {
+                RunStatus::Idle => {
+                    ui.label(RichText::new("就绪").weak());
+                }
+                RunStatus::Running => {
+                    ui.spinner();
+                    ui.label("正在迁移…");
+                }
+                RunStatus::Finished { warnings: 0 } => {
+                    ui.label(RichText::new("✔ 迁移完成").color(log_color(ui, LogLevel::Success)));
+                }
+                RunStatus::Finished { warnings } => {
+                    ui.label(
+                        RichText::new(format!("⚠ 迁移完成，{warnings} 条警告"))
+                            .color(log_color(ui, LogLevel::Warning)),
+                    );
+                }
+                RunStatus::Failed => {
+                    ui.label(RichText::new("✖ 迁移失败").color(log_color(ui, LogLevel::Error)));
+                }
+            }
+            if let (Some(template), Some(target)) = (
+                self.selected_instance(self.template_index),
+                self.selected_instance(self.target_index),
+            ) {
+                ui.separator();
+                ui.label(RichText::new(format!("{} → {}", template.name, target.name)).weak());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let button = egui::Button::new(
+                    RichText::new("开始迁移")
+                        .size(16.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .fill(ACCENT)
+                .min_size(egui::vec2(140.0, 34.0));
+                if ui.add_enabled(!self.is_running(), button).clicked() {
+                    self.start_migration(ctx);
+                }
+            });
+        });
+        ui.add_space(6.0);
+    }
+
+    fn show_log_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("日志").size(16.0).strong());
+            let count = |level| {
+                self.logs
+                    .iter()
+                    .filter(|entry| entry.level == level)
+                    .count()
+            };
+            let (warnings, errors) = (count(LogLevel::Warning), count(LogLevel::Error));
+            if warnings > 0 {
+                ui.label(
+                    RichText::new(format!("⚠ {warnings}")).color(log_color(ui, LogLevel::Warning)),
+                );
+            }
+            if errors > 0 {
+                ui.label(
+                    RichText::new(format!("✖ {errors}")).color(log_color(ui, LogLevel::Error)),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!self.is_running(), egui::Button::new("清空"))
+                    .clicked()
+                {
+                    self.logs.clear();
+                    self.status = RunStatus::Idle;
+                }
+            });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if self.logs.is_empty() {
+                    ui.label(RichText::new("还没有日志").weak());
+                }
+                for entry in &self.logs {
+                    let color = log_color(ui, entry.level);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(log_icon(entry.level))
+                                .color(color)
+                                .monospace(),
+                        );
+                        ui.label(RichText::new(&entry.message).color(color));
+                    });
+                }
+            });
     }
 
     fn show_conflict_dialog(&mut self, ctx: &egui::Context) {
@@ -444,19 +599,21 @@ impl MigratorApp {
         };
         let mut confirmed = false;
         egui::Modal::new(egui::Id::unique("pack_conflicts")).show(ctx, |ui| {
+            ui.set_max_width(560.0);
             let kind = dialog
                 .conflicts
                 .first()
                 .map_or(SharedAsset::ResourcePacks, |conflict| conflict.kind);
-            ui.heading(format!("{kind}同名冲突"));
+            ui.label(RichText::new(format!("{kind}同名冲突")).size(18.0).strong());
             ui.label(format!(
                 "以下{kind}名称相同但内容不同，请逐个决定保留现有版本还是使用新版本。被替换的版本会移入同级的 .bak 备份目录。"
             ));
             ui.separator();
             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                 for (conflict, choice) in dialog.conflicts.iter().zip(&mut dialog.choices) {
-                    ui.group(|ui| {
-                        ui.strong(&conflict.pack_name);
+                    card_frame(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(&conflict.pack_name).strong());
                         ui.label(format!("现有：{}", describe_version(&conflict.existing)));
                         ui.label(format!("新版本：{}", describe_version(&conflict.incoming)));
                         ui.horizontal(|ui| {
@@ -464,6 +621,7 @@ impl MigratorApp {
                             ui.radio_value(choice, ConflictChoice::UseIncoming, "使用新版本");
                         });
                     });
+                    ui.add_space(4.0);
                 }
             });
             ui.separator();
@@ -474,26 +632,19 @@ impl MigratorApp {
                 if ui.button("全部使用新版本").clicked() {
                     dialog.choices.fill(ConflictChoice::UseIncoming);
                 }
-                if ui.button("确定").clicked() {
-                    confirmed = true;
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let confirm = egui::Button::new(RichText::new("确定").color(Color32::WHITE))
+                        .fill(ACCENT);
+                    if ui.add(confirm).clicked() {
+                        confirmed = true;
+                    }
+                });
             });
         });
         if confirmed && let Some(dialog) = self.conflict_dialog.take() {
             // 后台线程已结束时发送会失败，迁移结果会通过 Finished 消息另行报告
             dialog.reply.send(dialog.choices).ok();
         }
-    }
-
-    fn show_log_section(&self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.logs {
-                    ui.label(line);
-                }
-            });
     }
 }
 
@@ -502,32 +653,97 @@ impl eframe::App for MigratorApp {
         self.drain_worker_messages();
         let ctx = ui.ctx().clone();
 
-        egui::Panel::top("controls").show(ui, |ui| {
-            ui.add_enabled_ui(!self.is_running(), |ui| {
-                ui.heading("实例");
-                self.show_instance_section(ui);
-                ui.separator();
-                self.show_preset_section(ui);
-                ui.heading("同步内容");
-                self.show_content_section(ui);
-                ui.separator();
-                if ui.button("开始迁移").clicked() {
-                    self.start_migration(&ctx);
-                }
-            });
-            if self.is_running() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("正在迁移…");
-                });
-            }
-            ui.add_space(4.0);
+        egui::Panel::top("header").show(ui, |ui| {
+            ui.add_space(6.0);
+            self.show_header(ui);
+            ui.add_space(6.0);
         });
+        egui::Panel::bottom("action_bar").show(ui, |ui| {
+            self.show_action_bar(ui, &ctx);
+        });
+        egui::Panel::left("settings")
+            .resizable(true)
+            .default_size(480.0)
+            .size_range(400.0..=640.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(6.0);
+                        ui.add_enabled_ui(!self.is_running(), |ui| self.show_settings(ui));
+                    });
+            });
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("日志");
-            self.show_log_section(ui);
+            self.show_log_panel(ui);
         });
         self.show_conflict_dialog(&ctx);
+    }
+}
+
+/// 统一圆角、间距与强调色；`all_styles_mut` 同时作用于浅色与深色主题。
+fn apply_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 4.0);
+        style.spacing.interact_size.y = 26.0;
+        let radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.noninteractive.corner_radius = radius;
+        style.visuals.widgets.inactive.corner_radius = radius;
+        style.visuals.widgets.hovered.corner_radius = radius;
+        style.visuals.widgets.active.corner_radius = radius;
+        style.visuals.widgets.open.corner_radius = radius;
+        style.visuals.window_corner_radius = egui::CornerRadius::same(10);
+        style.visuals.selection.bg_fill = ACCENT;
+        style.visuals.hyperlink_color = ACCENT;
+    });
+}
+
+fn card_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
+}
+
+/// 带标题的卡片分组，卡片宽度撑满所在面板。
+fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    card_frame(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(title).size(15.0).strong().color(ACCENT));
+        ui.add_space(2.0);
+        add_contents(ui);
+    });
+    ui.add_space(8.0);
+}
+
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(2.0);
+    ui.label(RichText::new(text).small().weak());
+}
+
+fn log_icon(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Info => "•",
+        LogLevel::Skip => "–",
+        LogLevel::Success => "✔",
+        LogLevel::Warning => "⚠",
+        LogLevel::Error => "✖",
+    }
+}
+
+/// 按当前主题选择日志颜色，深色主题使用更亮的色值以保证对比度。
+fn log_color(ui: &egui::Ui, level: LogLevel) -> Color32 {
+    let dark = ui.visuals().dark_mode;
+    match level {
+        LogLevel::Info => ui.visuals().text_color(),
+        LogLevel::Skip => ui.visuals().weak_text_color(),
+        LogLevel::Success if dark => Color32::from_rgb(120, 200, 140),
+        LogLevel::Success => Color32::from_rgb(30, 120, 60),
+        LogLevel::Warning if dark => Color32::from_rgb(235, 190, 90),
+        LogLevel::Warning => Color32::from_rgb(170, 110, 0),
+        LogLevel::Error if dark => Color32::from_rgb(240, 110, 110),
+        LogLevel::Error => Color32::from_rgb(190, 40, 40),
     }
 }
 
@@ -542,17 +758,6 @@ fn describe_version(version: &PackVersion) -> String {
         text.push_str(&format!(" · 数据版本 {data_version}"));
     }
     text
-}
-
-fn show_pack_combo(ui: &mut egui::Ui, kind: SharedAsset, choice: &mut PackChoice) {
-    egui::ComboBox::from_id_salt(format!("pack_combo_{kind}"))
-        .width(520.0)
-        .selected_text(choice.label(kind))
-        .show_ui(ui, |ui| {
-            for option in PackChoice::ALL {
-                ui.selectable_value(choice, option, option.label(kind));
-            }
-        });
 }
 
 fn format_size(bytes: u64) -> String {
@@ -588,7 +793,7 @@ fn show_instance_combo(
         .map(ToString::to_string)
         .unwrap_or_else(|| "请选择".to_string());
     egui::ComboBox::from_id_salt(id)
-        .width(520.0)
+        .width(ui.available_width())
         .selected_text(selected_text)
         .show_ui(ui, |ui| {
             for (index, instance) in instances.iter().enumerate() {
@@ -600,11 +805,22 @@ fn show_instance_combo(
 
 fn show_cache_combo(ui: &mut egui::Ui, kind: ServerCache, choice: &mut CacheChoice) {
     egui::ComboBox::from_id_salt(format!("cache_combo_{kind}"))
-        .width(520.0)
+        .width(ui.available_width())
         .selected_text(choice.label())
         .show_ui(ui, |ui| {
             for option in CacheChoice::ALL {
                 ui.selectable_value(choice, option, option.label());
+            }
+        });
+}
+
+fn show_pack_combo(ui: &mut egui::Ui, kind: SharedAsset, choice: &mut PackChoice) {
+    egui::ComboBox::from_id_salt(format!("pack_combo_{kind}"))
+        .width(ui.available_width())
+        .selected_text(choice.label(kind))
+        .show_ui(ui, |ui| {
+            for option in PackChoice::ALL {
+                ui.selectable_value(choice, option, option.label(kind));
             }
         });
 }
