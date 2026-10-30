@@ -26,6 +26,10 @@ use crate::types::{
 
 const CJK_FONT_NAME: &str = "msyh";
 const ACCENT: Color32 = Color32::from_rgb(76, 145, 98);
+const GITHUB_URL: &str = "https://github.com/CL-matt/mc-bindsync";
+const LORIAN_TOOL_URL: &str = "https://tools.voxisle.art/";
+const LORIAN_TOOL_LOGO: &[u8] = include_bytes!("../logos/logo-square-LorianTool.png");
+const HEADER_ICON_SIZE: f32 = 18.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -178,6 +182,8 @@ struct MigratorApp {
     status: RunStatus,
     worker: Option<Receiver<WorkerMessage>>,
     conflict_dialog: Option<ConflictDialog>,
+    /// 解码失败时为 `None`，标题栏改为只显示文字链接。
+    lorian_logo: Option<egui::TextureHandle>,
 }
 
 impl MigratorApp {
@@ -200,6 +206,7 @@ impl MigratorApp {
             status: RunStatus::Idle,
             worker: None,
             conflict_dialog: None,
+            lorian_logo: None,
         };
         apply_style(ctx);
         if let Err(err) = install_cjk_font(ctx) {
@@ -207,6 +214,13 @@ impl MigratorApp {
                 LogLevel::Warning,
                 format!("加载中文字体失败，界面文字可能无法显示：{err:#}"),
             );
+        }
+        match load_logo_texture(ctx) {
+            Ok(texture) => app.lorian_logo = Some(texture),
+            Err(err) => app.push_log(
+                LogLevel::Warning,
+                format!("加载 LorianTool 图标失败：{err:#}"),
+            ),
         }
         app.rescan_instances();
         app
@@ -390,6 +404,18 @@ impl MigratorApp {
             ui.label(RichText::new("把按键、配置、地图与缓存迁移到新实例").weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 egui::widgets::global_theme_preference_buttons(ui);
+                ui.separator();
+                let lorian_button = match &self.lorian_logo {
+                    Some(texture) => egui::Button::image_and_text(
+                        egui::Image::new(egui::load::SizedTexture::from_handle(texture))
+                            .fit_to_exact_size(egui::vec2(HEADER_ICON_SIZE, HEADER_ICON_SIZE)),
+                        "LorianTool",
+                    ),
+                    None => egui::Button::new("LorianTool"),
+                };
+                show_link_button(ui, lorian_button, LORIAN_TOOL_URL);
+                let github_label = format!("{} GitHub", egui::special_emojis::GITHUB);
+                show_link_button(ui, egui::Button::new(github_label), GITHUB_URL);
             });
         });
     }
@@ -698,6 +724,22 @@ fn apply_style(ctx: &egui::Context) {
     });
 }
 
+fn show_link_button(ui: &mut egui::Ui, button: egui::Button, url: &str) {
+    if ui.add(button.frame(false)).on_hover_text(url).clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+}
+
+/// 把内嵌的 PNG 图标解码为纹理；egui 本身不解码 PNG，借助 `image` 完成。
+fn load_logo_texture(ctx: &egui::Context) -> Result<egui::TextureHandle> {
+    let rgba = image::load_from_memory_with_format(LORIAN_TOOL_LOGO, image::ImageFormat::Png)
+        .context("PNG 解码失败")?
+        .to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    Ok(ctx.load_texture("lorian_tool_logo", pixels, egui::TextureOptions::LINEAR))
+}
+
 fn card_frame(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::new()
         .fill(ui.visuals().faint_bg_color)
@@ -852,4 +894,17 @@ fn install_cjk_font(ctx: &egui::Context) -> Result<()> {
     }
     ctx.set_fonts(fonts);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_lorian_tool_logo_decodes() -> Result<()> {
+        let texture = load_logo_texture(&egui::Context::default())?;
+        let [width, height] = texture.size();
+        assert!(width > 0 && height > 0);
+        Ok(())
+    }
 }

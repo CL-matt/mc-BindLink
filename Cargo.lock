@@ -1788,6 +1788,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "flate2",
+ "image",
  "rfd",
  "serde_json",
  "toml_edit",
