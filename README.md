@@ -1,13 +1,76 @@
 # bindsync
 
-Tired of manually rebinding dozens of keys every time you switch modpacks, upgrade versions, or download a friend's client? **BindSync** is a lightweight, standalone desktop utility written in Rust that ports your personal keybindings and mod-specific configurations across instances seamlessly.
+bindsync 是一个 Windows 桌面工具，把一个 Minecraft 实例里的按键、选项、Mod 配置、地图路点和 Voxy 缓存迁移到另一个实例。换整合包、升级版本或拿到朋友的客户端时，不用再手动重设几十个按键。
 
-### ✨ Key Features
-- **One-Click Sync**: Transfer your controls and preferences instantly—no need to touch `options.txt` by hand.
-- **Auto-Detection for Launchers**: Automatically detects HMCL and PCL2 instances, including isolated version folders (`.minecraft/versions/<name>`).
-- **Smart Mod Inspection**: Inspects `.jar` metadata (`fabric.mod.json` & `mods.toml`) to detect installed mods (e.g., Axiom, Flashback) and syncs their dedicated config files safely.
-- **Two Flexible Sync Modes**:
-  - **Partial Merge**: Injects your custom keybinds while keeping the modpack's original render distance, FOV, and sound levels intact.
-  - **Full Overwrite**: Synchronizes your full player profile (render distance, sensitivity, master volumes, FOV, and controls).
-- **Safety First**: Automatically creates a `.bak` backup before modifying any files.
-- **Zero Overhead**: Single, tiny binary (~4MB) with instantaneous startup and zero runtime dependencies.
+## 功能
+
+- **实例发现**：自动扫描程序所在目录及其上级目录中的 `.minecraft`，也可以手动添加目录。识别 `versions/<名称>/` 下的版本隔离实例，并标注由 PCL2 创建的实例。
+- **两种同步模式**：
+  - 局部合并：只同步 `key_` 开头的按键条目，保留目标整合包的视距、FOV、画质和音量。
+  - 全量覆写：以模板为准覆盖全部选项，`version`、窗口分辨率、音频设备、资源包列表、上次连接的服务器等与本机或目标实例绑定的条目保留原值。
+- **Mod 配置**：读取 `mods/` 中 jar 的元数据（`fabric.mod.json`、`quilt.mod.json`、`META-INF/mods.toml`、`META-INF/neoforge.mods.toml`）识别已安装的 Mod，目前支持同步 Axiom 的按键配置。
+- **地图与路点**：按单人存档名或服务器地址同步 Xaero 小地图与世界地图数据，只补充缺少的文件和更新过的文件，不删除目标已有的文件。
+- **Voxy 缓存**：可选择物理复制，或用 Junction 让多个实例共用同一份缓存，不占额外磁盘空间。
+- **自动备份**：修改任何配置文件前先生成 `.bak` 备份。
+
+## 使用说明
+
+### 准备
+
+1. 关闭所有正在运行的 Minecraft。游戏运行时会锁住 Voxy 缓存，也可能在退出时覆盖刚迁移的 `options.txt`。
+2. 目标实例至少要启动过一次游戏，生成自己的 `options.txt`。目标没有 `options.txt` 时，工具会跳过选项同步并在日志中提示。
+3. 把 `mc-bindsync.exe` 放到 PCL 程序所在的文件夹（与 `.minecraft` 同级），启动时会自动发现其中的实例。放在其他位置也可以，启动后用"添加目录…"选择 `.minecraft`、它的上级目录或某个版本目录。
+
+### 迁移步骤
+
+1. **选择实例**：在"模板实例"中选择配置好的旧实例，在"目标实例"中选择要写入的新实例。鼠标悬停在选项上可以看到实例的完整路径。实例名后的"隔离"表示版本隔离实例，"根目录"表示 `.minecraft` 本身的共享配置。
+2. **选择同步内容**：
+   - "按键与选项（options.txt）"和"Mod 独立配置"按"同步模式"执行。只想迁移按键时选"局部合并"，想让新实例的画面、声音等设置和旧实例完全一致时选"全量覆写"。
+   - "地图与路点（Xaero）"会把模板中所有世界和服务器的地图数据同步到目标。
+3. **选择 Voxy 缓存的处理方式**：
+   - 不处理：保持目标现状。
+   - 物理复制：迁移后准备删除旧实例时选用。缓存通常有数百 MB 到数 GB，复制需要一段时间。
+   - Junction 指向源实例：旧实例还要继续玩时选用，两个实例共用同一份缓存。删除旧实例后链接会失效。
+   - Junction 指向共享目录：同一个服务器的整合包反复更新时选用。点击"选择共享目录…"指定一个长期保存缓存的文件夹，工具会把旧实例的缓存移过去，旧实例和新实例都链接到这里。以后整合包再更新，只需对新版本再执行一次。
+4. 点击"开始迁移"，在下方日志中查看每一步的结果。结束时日志会显示修改数量和警告数量，有警告时向上查看具体原因。
+
+使用 Junction 时，共用同一份缓存的多个实例不能同时运行。
+
+### 备份与恢复
+
+| 内容 | 备份位置 | 恢复方法 |
+| --- | --- | --- |
+| `options.txt`、Mod 配置文件 | 同目录下的 `<文件名>.bak`（第一次修改前的原始文件，永久保留）和 `<文件名>.<时间戳>.bak`（之后每次修改前的版本，保留最近 5 份） | 删除当前文件，把需要的备份文件改回原文件名 |
+| Voxy 缓存 | 目标原有的缓存目录被重命名为 `<目录名>.<时间戳>.bak` | 删除新建的链接或目录后，把备份目录改回原名 |
+| 地图与路点 | 不逐个备份，执行前在日志中列出将被覆盖的文件 | 需要时请自行提前备份 `xaero` 目录 |
+
+删除 Junction 时请在命令提示符中执行 `rmdir "<链接路径>"`，该命令只删除链接本身，不会删除链接指向的缓存。
+
+### 限制
+
+- 暂不支持 HMCL 的启动器标注与 JourneyMap 地图同步，计划见 [todolist.md](todolist.md)。
+- 模板与目标分处 1.13 前后时，两者的按键格式不兼容，工具会跳过全部按键条目，只迁移其他选项。
+- 损坏的 jar 或不规范的 Mod 元数据会被跳过并记录在日志中，不影响其他 Mod 的识别。
+
+## 从源码构建
+
+需要 Rust 的 `x86_64-pc-windows-gnu` 工具链，以及提供 `dlltool` 与 `as` 的完整 MinGW-w64（例如 WinLibs），并把 MinGW-w64 的 `bin` 目录加入 PATH。
+
+```
+cargo build --release
+```
+
+`.cargo/config.toml` 把构建产物目录设在 `<构建目录>`，其他机器上构建前请修改或删除该配置。运行 `cargo test` 执行单元测试。
+
+## 项目结构
+
+| 路径 | 内容 |
+| --- | --- |
+| `src/main.rs` | 界面与交互 |
+| `src/launcher.rs` | 实例发现与启动器标注 |
+| `src/engine.rs` | `options.txt` 同步、Mod 识别、Mod 配置同步与备份 |
+| `src/map_sync.rs` | 地图路点同步与 Voxy 缓存迁移 |
+| `src/types.rs` | 公用数据结构 |
+| `mem.md` | 项目设计与同步规则 |
+| `todolist.md` | 待实现功能 |
+| `CLAUDE.md`、`docs/` | 开发规范 |
