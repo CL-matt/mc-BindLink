@@ -123,7 +123,7 @@
   - IO / 压缩：`zip`, `walkdir`, `anyhow`, `flate2`（解压 Axiom 蓝图的 gzip 方块数据；已是 `zip` 的间接依赖，经用户批准改为直接依赖）
 
 ### 文件模块组织
-- `src/main.rs`: 界面逻辑、状态存储、事件处理与日志流展示。
+- `src/main.rs`: 界面逻辑、状态存储、事件处理与日志流展示。界面为左右分栏：左侧可滚动的分组卡片（实例、固定配置、按键与配置、地图与缓存、材质包与蓝图、按需出现的共享目录），右侧为按级别着色的日志，底部操作栏放置状态与"开始迁移"按钮；主题默认跟随系统，右上角可切换浅色或深色。
 - `src/engine.rs`: 核心业务逻辑（`options.txt` 解析、Mod 检测、配置读写与备份）。
 - `src/launcher.rs`: 启动器路径嗅探、隔离版本扫描。
 - `src/map_sync.rs`: 地图路点目录递归同步与 Voxy、Bobby 缓存链接或拷贝；同时提供 Junction、移动、占用检测等目录操作供 `pack_sync.rs` 复用。
@@ -134,6 +134,7 @@
 - `DetectedInstance` 包含 `launcher: LauncherKind` 字段，`LauncherKind` 取值为 `Pcl2 / Unknown`，定义在 `src/types.rs`。
 - `ServerCache`（`Voxy / Bobby`）标识缓存种类，`CacheTransfer`（`Copy / LinkToSource / LinkToShared(共享目录)`）表示迁移方式；`MigrationRequest` 的 `voxy`、`bobby` 字段各为 `Option<CacheTransfer>`，`None` 表示不处理。
 - `SharedAsset`（`ResourcePacks / AxiomBlueprints`）标识资源种类；`PackTransfer`（`CopyMissing / LinkToShared(共享目录)`）表示处理方式，对应 `MigrationRequest.resource_packs` 与 `MigrationRequest.axiom_blueprints`；同名冲突以 `PackConflict`（种类、名称、`existing` 与 `incoming` 两个 `PackVersion`：来源、大小、修改时间、蓝图数据版本）交给界面，用户返回 `ConflictChoice`（`KeepExisting / UseIncoming`）。后台线程通过消息把冲突发给界面并阻塞等待回复。
+- 业务模块通过 `LogSink` 输出 `LogEntry`（`LogLevel`：`Info / Skip / Success / Warning / Error`），界面据此着色：跳过的操作用 `Skip`，已写入、复制或链接用 `Success`，单个条目失败用 `Warning`，整个步骤失败用 `Error`。
 - `src/test_support.rs` 仅在测试编译时引入，提供测试用临时目录。
 
 ### 开发环境
