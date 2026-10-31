@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod engine;
+mod fs_ops;
+mod journal;
 mod launcher;
 mod map_sync;
 mod pack_sync;
@@ -20,8 +22,9 @@ use anyhow::{Context, Result, anyhow};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::types::{
-    CacheTransfer, ConflictChoice, DetectedInstance, LogEntry, LogLevel, LogSink, MigrationRequest,
-    MigrationResult, PackConflict, PackTransfer, PackVersion, ServerCache, SharedAsset, SyncMode,
+    CacheTransfer, ConflictChoice, DetectedInstance, HistoryEntry, LogEntry, LogLevel, LogSink,
+    MigrationRequest, MigrationResult, PackConflict, PackTransfer, PackVersion, ServerCache,
+    SharedAsset, SyncMode,
 };
 
 const CJK_FONT_NAME: &str = "msyh";
@@ -188,12 +191,28 @@ const PRESETS: &[Preset] = &[
     },
 ];
 
-/// 底部状态栏显示的最近一次迁移结果。
+/// 底部状态栏显示的最近一次任务结果。
 enum RunStatus {
     Idle,
     Running,
     Finished { warnings: usize },
     Failed,
+}
+
+/// 后台线程正在或最近执行的任务，决定状态栏与日志中的措辞。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Task {
+    Migration,
+    Rollback,
+}
+
+impl Task {
+    fn label(self) -> &'static str {
+        match self {
+            Task::Migration => "迁移",
+            Task::Rollback => "回退",
+        }
+    }
 }
 
 struct MigratorApp {
@@ -214,6 +233,12 @@ struct MigratorApp {
     shared_dir: Option<PathBuf>,
     logs: Vec<LogEntry>,
     status: RunStatus,
+    task: Task,
+    /// 找不到 APPDATA 时为 `None`，此时无法记录迁移，也无法迁移。
+    history_root: Option<PathBuf>,
+    /// 尚未回退的迁移记录，最新的在前。
+    history: Vec<HistoryEntry>,
+    confirm_rollback: bool,
     worker: Option<Receiver<WorkerMessage>>,
     conflict_dialog: Option<ConflictDialog>,
     /// 未编译进图标或解码失败时为 `None`，标题栏改为只显示文字链接。
@@ -241,6 +266,10 @@ impl MigratorApp {
             shared_dir: None,
             logs: Vec::new(),
             status: RunStatus::Idle,
+            task: Task::Migration,
+            history_root: None,
+            history: Vec::new(),
+            confirm_rollback: false,
             worker: None,
             conflict_dialog: None,
             lorian_logo: None,
@@ -269,8 +298,26 @@ impl MigratorApp {
             Ok(texture) => app.app_logo = Some(texture),
             Err(err) => app.push_log(LogLevel::Warning, format!("加载软件图标失败：{err:#}")),
         }
+        match journal::history_root() {
+            Ok(root) => app.history_root = Some(root),
+            Err(err) => app.push_log(
+                LogLevel::Error,
+                format!("无法确定迁移记录的保存位置，迁移与回退不可用：{err:#}"),
+            ),
+        }
+        app.refresh_history();
         app.rescan_instances();
         app
+    }
+
+    fn refresh_history(&mut self) {
+        let Some(root) = &self.history_root else {
+            return;
+        };
+        match journal::list_history(root) {
+            Ok(history) => self.history = history,
+            Err(err) => self.push_log(LogLevel::Warning, format!("读取迁移历史失败：{err:#}")),
+        }
     }
 
     fn push_log(&mut self, level: LogLevel, message: impl Into<String>) {
@@ -375,6 +422,10 @@ impl MigratorApp {
                 return;
             }
         };
+        let Some(history_root) = self.history_root.clone() else {
+            self.push_log(LogLevel::Error, "无法记录迁移，已取消");
+            return;
+        };
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         // 复制 Voxy 或 Bobby 缓存可能耗时数分钟，放到后台线程以免阻塞界面
@@ -394,12 +445,40 @@ impl MigratorApp {
                     .recv()
                     .map_err(|_| anyhow!("未收到同名冲突的处理选择"))
             };
-            let outcome =
-                engine::run_migration(&request, &mut resolve, &mut LogSink::new(&mut emit));
+            let outcome = engine::run_migration(
+                &request,
+                &history_root,
+                &mut resolve,
+                &mut LogSink::new(&mut emit),
+            );
             sender.send(WorkerMessage::Finished(outcome)).ok();
             ctx.request_repaint();
         });
         self.worker = Some(receiver);
+        self.task = Task::Migration;
+        self.status = RunStatus::Running;
+    }
+
+    /// 回退最近一次迁移；回退可能移动整个缓存目录，同样放到后台线程执行。
+    fn start_rollback(&mut self, ctx: &egui::Context) {
+        let Some(entry) = self.history.first() else {
+            return;
+        };
+        let record_dir = entry.dir.clone();
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            // 发送失败只会发生在窗口关闭、接收端已释放之后，此时没有可写日志的地方
+            let mut emit = |entry: LogEntry| {
+                sender.send(WorkerMessage::Log(entry)).ok();
+                ctx.request_repaint();
+            };
+            let outcome = journal::rollback(&record_dir, &mut LogSink::new(&mut emit));
+            sender.send(WorkerMessage::Finished(outcome)).ok();
+            ctx.request_repaint();
+        });
+        self.worker = Some(receiver);
+        self.task = Task::Rollback;
         self.status = RunStatus::Running;
     }
 
@@ -420,12 +499,13 @@ impl MigratorApp {
                     });
                 }
                 Ok(WorkerMessage::Finished(outcome)) => {
-                    finished = Some(outcome.map_err(|err| format!("迁移失败：{err:#}")));
+                    let task = self.task.label();
+                    finished = Some(outcome.map_err(|err| format!("{task}失败：{err:#}")));
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    finished = Some(Err("迁移线程意外退出".to_string()));
+                    finished = Some(Err(format!("{}线程意外退出", self.task.label())));
                     break;
                 }
             }
@@ -435,16 +515,18 @@ impl MigratorApp {
             return;
         };
         self.worker = None;
+        self.refresh_history();
+        let task = self.task.label();
         match outcome {
             Ok(result) if result.warnings.is_empty() => {
-                self.push_log(LogLevel::Success, "迁移完成");
+                self.push_log(LogLevel::Success, format!("{task}完成"));
                 self.status = RunStatus::Finished { warnings: 0 };
             }
             Ok(result) => {
                 let warnings = result.warnings.len();
                 self.push_log(
                     LogLevel::Warning,
-                    format!("迁移完成，但有 {warnings} 条警告，请查看上方日志"),
+                    format!("{task}完成，但有 {warnings} 条警告，请查看上方日志"),
                 );
                 self.status = RunStatus::Finished { warnings };
             }
@@ -606,6 +688,7 @@ impl MigratorApp {
                 });
             });
         }
+        self.show_history_section(ui);
     }
 
     fn show_action_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -617,19 +700,25 @@ impl MigratorApp {
                 }
                 RunStatus::Running => {
                     ui.spinner();
-                    ui.label("正在迁移…");
+                    ui.label(format!("正在{}…", self.task.label()));
                 }
                 RunStatus::Finished { warnings: 0 } => {
-                    ui.label(RichText::new("✔ 迁移完成").color(log_color(ui, LogLevel::Success)));
+                    ui.label(
+                        RichText::new(format!("✔ {}完成", self.task.label()))
+                            .color(log_color(ui, LogLevel::Success)),
+                    );
                 }
                 RunStatus::Finished { warnings } => {
                     ui.label(
-                        RichText::new(format!("⚠ 迁移完成，{warnings} 条警告"))
+                        RichText::new(format!("⚠ {}完成，{warnings} 条警告", self.task.label()))
                             .color(log_color(ui, LogLevel::Warning)),
                     );
                 }
                 RunStatus::Failed => {
-                    ui.label(RichText::new("✖ 迁移失败").color(log_color(ui, LogLevel::Error)));
+                    ui.label(
+                        RichText::new(format!("✖ {}失败", self.task.label()))
+                            .color(log_color(ui, LogLevel::Error)),
+                    );
                 }
             }
             if let (Some(template), Some(target)) = (
@@ -706,6 +795,88 @@ impl MigratorApp {
                     });
                 }
             });
+    }
+
+    fn show_history_section(&mut self, ui: &mut egui::Ui) {
+        section(ui, "迁移历史", |ui| {
+            if self.history.is_empty() {
+                ui.label(RichText::new("没有可回退的迁移").weak());
+                return;
+            }
+            ui.label(
+                RichText::new(
+                    "只能从最近一次开始逐次回退；迁移后被改动过的文件会另存为 .rollback 后再恢复",
+                )
+                .weak()
+                .small(),
+            );
+            for (index, entry) in self.history.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let text = format!(
+                        "{} · {} → {} · {} 项操作",
+                        format_elapsed(entry.created_at),
+                        entry.template,
+                        entry.target,
+                        entry.operation_count
+                    );
+                    if index == 0 {
+                        ui.label(text);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("回退").clicked() {
+                                self.confirm_rollback = true;
+                            }
+                        });
+                    } else {
+                        ui.label(RichText::new(text).weak());
+                    }
+                });
+            }
+        });
+    }
+
+    fn show_rollback_confirm(&mut self, ctx: &egui::Context) {
+        if !self.confirm_rollback {
+            return;
+        }
+        let Some(entry) = self.history.first() else {
+            self.confirm_rollback = false;
+            return;
+        };
+        let summary = format!(
+            "{} → {}（{}，{} 项操作）",
+            entry.template,
+            entry.target,
+            format_elapsed(entry.created_at),
+            entry.operation_count
+        );
+        let mut decision = None;
+        egui::Modal::new(egui::Id::unique("rollback_confirm")).show(ctx, |ui| {
+            ui.set_max_width(480.0);
+            ui.label(RichText::new("确认回退").size(18.0).strong());
+            ui.label(format!("将撤销这次迁移：{summary}"));
+            ui.label("请先关闭相关的游戏实例。迁移后被游戏或你改动过的文件，会先另存为 .rollback 再恢复。");
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("取消").clicked() {
+                    decision = Some(false);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let confirm = egui::Button::new(RichText::new("确认回退").color(Color32::WHITE))
+                        .fill(ACCENT);
+                    if ui.add(confirm).clicked() {
+                        decision = Some(true);
+                    }
+                });
+            });
+        });
+        match decision {
+            Some(true) => {
+                self.confirm_rollback = false;
+                self.start_rollback(ctx);
+            }
+            Some(false) => self.confirm_rollback = false,
+            None => {}
+        }
     }
 
     fn show_conflict_dialog(&mut self, ctx: &egui::Context) {
@@ -792,6 +963,7 @@ impl eframe::App for MigratorApp {
             self.show_log_panel(ui);
         });
         self.show_conflict_dialog(&ctx);
+        self.show_rollback_confirm(&ctx);
     }
 }
 
@@ -908,6 +1080,20 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} MB", bytes / (KB * KB))
     } else {
         format!("{:.1} KB", bytes / KB)
+    }
+}
+
+/// 显示相对时间，避免为本地时区换算引入新依赖。
+fn format_elapsed(created_at: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(created_at);
+    match now.saturating_sub(created_at) {
+        seconds if seconds < 60 => "刚刚".to_string(),
+        seconds if seconds < 3_600 => format!("{} 分钟前", seconds / 60),
+        seconds if seconds < 86_400 => format!("{} 小时前", seconds / 3_600),
+        seconds => format!("{} 天前", seconds / 86_400),
     }
 }
 

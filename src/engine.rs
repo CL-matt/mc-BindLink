@@ -10,8 +10,9 @@ use toml_edit::DocumentMut;
 use zip::ZipArchive;
 use zip::result::ZipError;
 
+use crate::journal::Journal;
 use crate::map_sync;
-use crate::pack_sync::{self, ConflictResolver};
+use crate::pack_sync::{self, AssetSyncRequest, ConflictResolver};
 use crate::types::{
     LogSink, MigrationRequest, MigrationResult, PackTransfer, ServerCache, SharedAsset, SyncMode,
 };
@@ -56,9 +57,11 @@ const MOD_CONFIG_RULES: &[ModConfigRule] = &[ModConfigRule {
 /// 按 `request` 依次执行各同步步骤。
 ///
 /// 单个步骤失败时记录到日志与 `MigrationResult::warnings` 并继续后续步骤，
-/// 使按键同步不会因为地图或缓存的问题而中断。
+/// 使按键同步不会因为地图或缓存的问题而中断。所有改动登记在 `history_root` 下的迁移记录中，
+/// 即使部分步骤失败也可以回退已完成的部分。
 pub fn run_migration(
     request: &MigrationRequest,
+    history_root: &Path,
     resolve: &mut ConflictResolver,
     log: &mut LogSink,
 ) -> Result<MigrationResult> {
@@ -71,18 +74,34 @@ pub fn run_migration(
         "开始迁移：{} → {}",
         request.template, request.target
     ));
+    let mut journal = Journal::begin(history_root, &request.template.name, &request.target.name)?;
+    let journal = &mut journal;
 
     let mut result = MigrationResult::default();
     if request.sync_options {
-        let outcome = sync_options_file(template_dir, target_dir, request.mode, log, &mut result);
+        let outcome = sync_options_file(
+            template_dir,
+            target_dir,
+            request.mode,
+            journal,
+            log,
+            &mut result,
+        );
         record_step_failure("options.txt 同步", outcome, log, &mut result);
     }
     if request.sync_mod_configs {
-        let outcome = sync_mod_configs(template_dir, target_dir, request.mode, log, &mut result);
+        let outcome = sync_mod_configs(
+            template_dir,
+            target_dir,
+            request.mode,
+            journal,
+            log,
+            &mut result,
+        );
         record_step_failure("Mod 配置同步", outcome, log, &mut result);
     }
     if request.sync_maps {
-        let outcome = map_sync::sync_map_directories(template_dir, target_dir, log)
+        let outcome = map_sync::sync_map_directories(template_dir, target_dir, journal, log)
             .map(|step| merge_result(&mut result, step));
         record_step_failure("地图与路点同步", outcome, log, &mut result);
     }
@@ -94,40 +113,48 @@ pub fn run_migration(
         let Some(method) = method else {
             continue;
         };
-        let outcome = map_sync::transfer_server_caches(kind, template_dir, target_dir, method, log)
-            .map(|step| merge_result(&mut result, step));
+        let outcome =
+            map_sync::transfer_server_caches(kind, template_dir, target_dir, method, journal, log)
+                .map(|step| merge_result(&mut result, step));
         record_step_failure(&format!("{kind} 缓存迁移"), outcome, log, &mut result);
     }
     if let Some(method) = &request.resource_packs {
         let outcome = pack_sync::sync_shared_assets(
-            SharedAsset::ResourcePacks,
-            &request.template,
-            &request.target,
-            method,
-            None,
+            &AssetSyncRequest {
+                kind: SharedAsset::ResourcePacks,
+                template: &request.template,
+                target: &request.target,
+                method,
+                max_data_version: None,
+            },
             resolve,
+            journal,
             log,
         )
         .map(|step| merge_result(&mut result, step.result));
         record_step_failure("材质包同步", outcome, log, &mut result);
         // 只有共享目录保证两个实例拥有相同的材质包文件，启用列表才能安全照搬
         if matches!(method, PackTransfer::LinkToShared(_)) {
-            let outcome = sync_enabled_pack_list(template_dir, target_dir, log, &mut result);
+            let outcome =
+                sync_enabled_pack_list(template_dir, target_dir, journal, log, &mut result);
             record_step_failure("材质包启用列表同步", outcome, log, &mut result);
         }
     }
     if let Some(method) = &request.axiom_blueprints {
-        let outcome = sync_axiom_blueprints(request, method, resolve, log, &mut result);
+        let outcome = sync_axiom_blueprints(request, method, resolve, journal, log, &mut result);
         record_step_failure("Axiom 蓝图同步", outcome, log, &mut result);
     }
     if let Some(method) = &request.screenshots {
         let outcome = pack_sync::sync_shared_assets(
-            SharedAsset::Screenshots,
-            &request.template,
-            &request.target,
-            method,
-            None,
+            &AssetSyncRequest {
+                kind: SharedAsset::Screenshots,
+                template: &request.template,
+                target: &request.target,
+                method,
+                max_data_version: None,
+            },
             resolve,
+            journal,
             log,
         )
         .map(|step| merge_result(&mut result, step.result));
@@ -139,6 +166,7 @@ pub fn run_migration(
         result.changed_paths.len(),
         result.warnings.len()
     ));
+    journal.finish()?;
     Ok(result)
 }
 
@@ -352,6 +380,7 @@ fn sync_options_file(
     template_dir: &Path,
     target_dir: &Path,
     mode: SyncMode,
+    journal: &mut Journal,
     log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
@@ -382,8 +411,7 @@ fn sync_options_file(
     if let Some(backup) = backup_file_safely(&target_path)? {
         log.info(format!("已备份到 {}", backup.display()));
     }
-    fs::write(&target_path, target.to_text())
-        .with_context(|| format!("写入 {} 失败", target_path.display()))?;
+    journal.write_file(&target_path, target.to_text())?;
     log.success(format!("options.txt：更新 {changed} 个条目"));
     result.changed_paths.push(target_path);
     Ok(())
@@ -393,6 +421,7 @@ fn sync_options_file(
 fn sync_enabled_pack_list(
     template_dir: &Path,
     target_dir: &Path,
+    journal: &mut Journal,
     log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
@@ -419,8 +448,7 @@ fn sync_enabled_pack_list(
     if let Some(backup) = backup_file_safely(&target_path)? {
         log.info(format!("已备份到 {}", backup.display()));
     }
-    fs::write(&target_path, target.to_text())
-        .with_context(|| format!("写入 {} 失败", target_path.display()))?;
+    journal.write_file(&target_path, target.to_text())?;
     log.success("材质包启用列表：已按模板更新".to_string());
     result.changed_paths.push(target_path);
     Ok(())
@@ -434,6 +462,7 @@ fn sync_axiom_blueprints(
     request: &MigrationRequest,
     method: &PackTransfer,
     resolve: &mut ConflictResolver,
+    journal: &mut Journal,
     log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
@@ -465,17 +494,20 @@ fn sync_axiom_blueprints(
     let blueprint_dir = pack_sync::asset_dir(SharedAsset::AxiomBlueprints);
     let template_order = read_blueprint_ordering(&template_dir.join(blueprint_dir))?;
     let outcome = pack_sync::sync_shared_assets(
-        SharedAsset::AxiomBlueprints,
-        &request.template,
-        &request.target,
-        method,
-        max_data_version,
+        &AssetSyncRequest {
+            kind: SharedAsset::AxiomBlueprints,
+            template: &request.template,
+            target: &request.target,
+            method,
+            max_data_version,
+        },
         resolve,
+        journal,
         log,
     )?;
     merge_result(result, outcome.result);
     for (dir, names) in outcome.added {
-        append_blueprint_ordering(&dir, &names, &template_order, log, result)?;
+        append_blueprint_ordering(&dir, &names, &template_order, journal, log, result)?;
     }
     Ok(())
 }
@@ -515,6 +547,7 @@ fn append_blueprint_ordering(
     dir: &Path,
     names: &[String],
     template_order: &[String],
+    journal: &mut Journal,
     log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
@@ -542,7 +575,7 @@ fn append_blueprint_ordering(
         log.info(format!("已备份到 {}", backup.display()));
     }
     let text: String = ordering.iter().map(|name| format!("{name}\n")).collect();
-    fs::write(&path, text).with_context(|| format!("写入 {} 失败", path.display()))?;
+    journal.write_file(&path, text)?;
     log.success(format!("Axiom 蓝图：已更新排序文件 {}", path.display()));
     result.changed_paths.push(path);
     Ok(())
@@ -652,6 +685,7 @@ fn sync_mod_configs(
     template_dir: &Path,
     target_dir: &Path,
     mode: SyncMode,
+    journal: &mut Journal,
     log: &mut LogSink,
     result: &mut MigrationResult,
 ) -> Result<()> {
@@ -671,7 +705,7 @@ fn sync_mod_configs(
             continue;
         }
         let destination = target_dir.join(rule.relative_path);
-        match apply_mod_config_rule(rule, &source, &destination, mode) {
+        match apply_mod_config_rule(rule, &source, &destination, mode, journal) {
             Ok(true) => {
                 log.success(format!("{}：已更新 {}", rule.mod_id, rule.relative_path));
                 result.changed_paths.push(destination);
@@ -693,6 +727,7 @@ fn apply_mod_config_rule(
     source: &Path,
     destination: &Path,
     mode: SyncMode,
+    journal: &mut Journal,
 ) -> Result<bool> {
     let template_text =
         fs::read_to_string(source).with_context(|| format!("读取 {} 失败", source.display()))?;
@@ -724,12 +759,7 @@ fn apply_mod_config_rule(
     };
 
     backup_file_safely(destination)?;
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建目录 {} 失败", parent.display()))?;
-    }
-    fs::write(destination, new_text)
-        .with_context(|| format!("写入 {} 失败", destination.display()))?;
+    journal.write_file(destination, new_text)?;
     Ok(true)
 }
 
@@ -740,7 +770,7 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_support::{TempDir, test_journal};
 
     #[test]
     fn merge_overwrites_and_appends_key_bindings_only() {
@@ -841,6 +871,7 @@ mod tests {
 
     #[test]
     fn sync_options_backs_up_before_writing() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("opt-template")?;
         let target = TempDir::new("opt-target")?;
         fs::write(
@@ -857,6 +888,7 @@ mod tests {
             template.path(),
             target.path(),
             SyncMode::Merge,
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
             &mut result,
         )?;
@@ -875,6 +907,7 @@ mod tests {
 
     #[test]
     fn sync_options_skips_target_without_options_file() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("opt-template-missing")?;
         let target = TempDir::new("opt-target-missing")?;
         fs::write(
@@ -887,6 +920,7 @@ mod tests {
             template.path(),
             target.path(),
             SyncMode::Merge,
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
             &mut result,
         )?;
@@ -946,6 +980,7 @@ mod tests {
 
     #[test]
     fn axiom_merge_replaces_only_keybinds() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("axiom-template")?;
         let target = TempDir::new("axiom-target")?;
         let rule = &MOD_CONFIG_RULES[0];
@@ -966,7 +1001,8 @@ mod tests {
             rule,
             &source,
             &destination,
-            SyncMode::Merge
+            SyncMode::Merge,
+            &mut journal
         )?);
         let merged: Value = serde_json::from_str(&fs::read_to_string(&destination)?)?;
         assert_eq!(
@@ -983,13 +1019,15 @@ mod tests {
             rule,
             &source,
             &destination,
-            SyncMode::Merge
+            SyncMode::Merge,
+            &mut journal
         )?);
         Ok(())
     }
 
     #[test]
     fn blueprint_ordering_appends_new_names_in_template_order() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let dir = TempDir::new("bp-ordering")?;
         fs::write(dir.path().join(BLUEPRINT_ORDERING_FILE), "mine.bp\n")?;
         let names = ["b.bp", "a.bp", "mine.bp", "z.bp"].map(String::from);
@@ -1000,6 +1038,7 @@ mod tests {
             dir.path(),
             &names,
             &template_order,
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
             &mut result,
         )?;
@@ -1014,6 +1053,7 @@ mod tests {
 
     #[test]
     fn enabled_pack_list_follows_template() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("packlist-template")?;
         let target = TempDir::new("packlist-target")?;
         fs::write(
@@ -1029,6 +1069,7 @@ mod tests {
         sync_enabled_pack_list(
             template.path(),
             target.path(),
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
             &mut result,
         )?;

@@ -227,3 +227,15 @@ pub struct MigrationResult {
     /// 被跳过但不影响其他步骤的问题。
     pub warnings: Vec<String>,
 }
+
+/// 一条尚未回退的迁移记录，供界面列出迁移历史。
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    /// 迁移开始时的 Unix 秒数。
+    pub created_at: u64,
+    pub template: String,
+    pub target: String,
+    pub operation_count: usize,
+    /// 记录所在目录，回退时传给 `journal::rollback`。
+    pub dir: PathBuf,
+}

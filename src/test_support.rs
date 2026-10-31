@@ -33,3 +33,10 @@ impl Drop for TempDir {
         }
     }
 }
+
+/// 写入临时目录的迁移记录；返回的 `TempDir` 需与记录一起保持存活。
+pub fn test_journal() -> Result<(TempDir, crate::journal::Journal)> {
+    let history = TempDir::new("history")?;
+    let journal = crate::journal::Journal::begin(history.path(), "模板", "目标")?;
+    Ok((history, journal))
+}

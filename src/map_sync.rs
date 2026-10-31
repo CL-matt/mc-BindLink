@@ -1,14 +1,12 @@
-use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
-use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::process::CommandExt;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
 use walkdir::WalkDir;
 
+use crate::fs_ops::{ensure_cache_not_in_use, is_link, resolve_real_path};
+use crate::journal::Journal;
 use crate::types::{CacheTransfer, LogSink, MigrationResult, ServerCache};
 
 /// 以世界键（单人存档名或 `Multiplayer_<服务器地址>`）为子目录的地图与路点根目录。
@@ -18,17 +16,16 @@ const MAP_ROOTS: &[&str] = &[
     "XaeroWaypoints",
     "XaeroWorldMap",
 ];
-const ERROR_SHARING_VIOLATION: i32 = 32;
-const ERROR_LOCK_VIOLATION: i32 = 33;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 把模板实例各世界键下的地图与路点文件同步到目标实例。
 ///
 /// 目标缺少的文件直接复制，同名文件仅在模板修改时间更新时覆盖，目标独有的文件保持不变。
-/// 地图文件数量大，按规则豁免逐文件 `.bak` 备份，改为执行前在日志中列出将被覆盖的文件。
+/// 地图文件数量大，豁免逐文件 `.bak` 备份，执行前在日志中列出将被覆盖的文件；
+/// 被覆盖文件的迁移前版本由 `journal` 另存，用于回退。
 pub fn sync_map_directories(
     template_dir: &Path,
     target_dir: &Path,
+    journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<MigrationResult> {
     let mut plan = Vec::new();
@@ -70,17 +67,7 @@ pub fn sync_map_directories(
     let overwrite_count = overwrites.len();
 
     for item in plan {
-        if let Some(parent) = item.destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("创建目录 {} 失败", parent.display()))?;
-        }
-        fs::copy(&item.source, &item.destination).with_context(|| {
-            format!(
-                "复制 {} 到 {} 失败",
-                item.source.display(),
-                item.destination.display()
-            )
-        })?;
+        journal.copy_file(&item.source, &item.destination)?;
         result.changed_paths.push(item.destination);
     }
     log.success(format!(
@@ -152,6 +139,7 @@ pub fn transfer_server_caches(
     template_dir: &Path,
     target_dir: &Path,
     method: &CacheTransfer,
+    journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<MigrationResult> {
     let mut result = MigrationResult::default();
@@ -169,12 +157,14 @@ pub fn transfer_server_caches(
     {
         let entry = entry.with_context(|| format!("读取目录 {} 失败", source_root.display()))?;
         let name = entry.file_name();
-        // 跳过本程序此前重命名留下的备份目录
-        if !entry.path().is_dir() || name.to_string_lossy().ends_with(".bak") {
+        // 跳过本程序此前迁移或回退时重命名留下的目录
+        let name_text = name.to_string_lossy();
+        if !entry.path().is_dir() || name_text.ends_with(".bak") || name_text.ends_with(".rollback")
+        {
             continue;
         }
         let target = target_root.join(&name);
-        match transfer_one_cache(kind, &entry.path(), &target, method, log) {
+        match transfer_one_cache(kind, &entry.path(), &target, method, journal, log) {
             Ok(true) => result.changed_paths.push(target),
             Ok(false) => {}
             Err(err) => {
@@ -193,6 +183,7 @@ fn transfer_one_cache(
     source: &Path,
     target: &Path,
     method: &CacheTransfer,
+    journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<bool> {
     let real_source = resolve_real_path(source)?;
@@ -212,13 +203,14 @@ fn transfer_one_cache(
             source,
             &real_source,
             shared_root,
+            journal,
             log,
         )?),
     };
 
     if target.exists() {
         ensure_cache_not_in_use(target)?;
-        let backup = rename_aside(target)?;
+        let backup = journal.rename_aside(target)?;
         log.info(format!(
             "{kind}：已将目标原有缓存重命名为 {}",
             backup.display()
@@ -227,7 +219,7 @@ fn transfer_one_cache(
 
     match link_destination {
         Some(destination) => {
-            create_junction(target, &destination)?;
+            journal.create_junction(target, &destination)?;
             log.success(format!(
                 "{kind}：{} → {}",
                 target.display(),
@@ -235,7 +227,7 @@ fn transfer_one_cache(
             ));
         }
         None => {
-            copy_dir_recursive(&real_source, target)?;
+            journal.copy_dir(&real_source, target)?;
             log.success(format!("{kind}：已复制 {}", target.display()));
         }
     }
@@ -248,6 +240,7 @@ fn prepare_shared_cache(
     source: &Path,
     real_source: &Path,
     shared_root: &Path,
+    journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<PathBuf> {
     let name = source
@@ -272,10 +265,10 @@ fn prepare_shared_cache(
     ensure_cache_not_in_use(real_source)?;
     fs::create_dir_all(&shared_root)
         .with_context(|| format!("创建目录 {} 失败", shared_root.display()))?;
-    move_dir(real_source, &shared)?;
+    journal.move_path(real_source, &shared)?;
     // 源实例的链接建立失败时把缓存移回原处，避免源实例丢失缓存
-    if let Err(err) = create_junction(source, &shared) {
-        move_dir(&shared, real_source).with_context(|| {
+    if let Err(err) = journal.create_junction(source, &shared) {
+        journal.move_path(&shared, real_source).with_context(|| {
             format!(
                 "建立链接失败且无法移回缓存，缓存现位于 {}",
                 shared.display()
@@ -290,136 +283,13 @@ fn prepare_shared_cache(
     Ok(shared)
 }
 
-/// 解析链接后的真实路径，并去掉 `canonicalize` 附加的 `\\?\` 前缀，使其可直接传给 `mklink`。
-pub(crate) fn resolve_real_path(path: &Path) -> Result<PathBuf> {
-    let canonical =
-        fs::canonicalize(path).with_context(|| format!("解析路径 {} 失败", path.display()))?;
-    let text = canonical.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        Some(stripped) if !stripped.starts_with("UNC\\") => Ok(PathBuf::from(stripped)),
-        _ => Ok(canonical),
-    }
-}
-
-pub(crate) fn is_link(path: &Path) -> Result<bool> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("读取 {} 的属性失败", path.display()))?;
-    Ok(metadata.file_type().is_symlink())
-}
-
-/// 逐个以不共享模式打开缓存中的文件，任何文件仍被其他进程打开时都会失败。
-///
-/// 游戏运行时会一直打开正在读写的缓存文件（Voxy 的 RocksDB、Bobby 的区块文件），
-/// 据此判断对应实例是否正在运行。
-pub(crate) fn ensure_cache_not_in_use(cache_dir: &Path) -> Result<()> {
-    for entry in WalkDir::new(cache_dir) {
-        let entry = entry.with_context(|| format!("遍历 {} 失败", cache_dir.display()))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let opened = OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(entry.path());
-        match opened {
-            Ok(_) => {}
-            Err(err)
-                if matches!(
-                    err.raw_os_error(),
-                    Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
-                ) =>
-            {
-                bail!("{} 正在被占用，请先关闭对应的游戏实例", cache_dir.display());
-            }
-            Err(err) => {
-                return Err(err).with_context(|| format!("检查 {} 失败", entry.path().display()));
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn rename_aside(path: &Path) -> Result<PathBuf> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("无法取得目录名：{}", path.display()))?
-        .to_string_lossy()
-        .into_owned();
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("系统时间早于 1970 年")?
-        .as_secs();
-    let backup = path.with_file_name(format!("{name}.{seconds}.bak"));
-    if backup.exists() {
-        bail!("备份目录 {} 已存在", backup.display());
-    }
-    fs::rename(path, &backup).with_context(|| format!("重命名 {} 失败", path.display()))?;
-    Ok(backup)
-}
-
-pub(crate) fn move_dir(from: &Path, to: &Path) -> Result<()> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        // 共享目录位于其他磁盘时无法直接重命名，改为复制后删除源目录
-        Err(err) if err.kind() == ErrorKind::CrossesDevices => {
-            copy_dir_recursive(from, to)?;
-            fs::remove_dir_all(from).with_context(|| format!("删除 {} 失败", from.display()))
-        }
-        Err(err) => {
-            Err(err).with_context(|| format!("移动 {} 到 {} 失败", from.display(), to.display()))
-        }
-    }
-}
-
-pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
-    for entry in WalkDir::new(source) {
-        let entry = entry.with_context(|| format!("遍历 {} 失败", source.display()))?;
-        let target = destination.join(entry.path().strip_prefix(source)?);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)
-                .with_context(|| format!("创建目录 {} 失败", target.display()))?;
-        } else {
-            fs::copy(entry.path(), &target).with_context(|| {
-                format!(
-                    "复制 {} 到 {} 失败",
-                    entry.path().display(),
-                    target.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-/// 通过 `mklink /J` 创建目录 Junction，无需管理员权限或开发者模式。
-pub(crate) fn create_junction(link: &Path, destination: &Path) -> Result<()> {
-    // mklink 不接受 `/` 分隔符，而 Path::join 拼接相对路径时会保留它
-    let to_native = |path: &Path| path.to_string_lossy().replace('/', "\\");
-    let output = Command::new("cmd")
-        .arg("/C")
-        .arg("mklink")
-        .arg("/J")
-        .arg(to_native(link))
-        .arg(to_native(destination))
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .context("无法执行 mklink")?;
-    if !output.status.success() {
-        bail!(
-            "创建 Junction {} 失败：{}",
-            link.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
+    use std::fs::{File, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt;
 
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_support::{TempDir, test_journal};
 
     fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
         File::options().write(true).open(path)?.set_modified(time)?;
@@ -428,6 +298,7 @@ mod tests {
 
     #[test]
     fn map_sync_copies_missing_and_newer_files_only() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("map-template")?;
         let target = TempDir::new("map-target")?;
         let source_world = template
@@ -453,6 +324,7 @@ mod tests {
         let result = sync_map_directories(
             template.path(),
             target.path(),
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 
@@ -493,6 +365,7 @@ mod tests {
 
     #[test]
     fn voxy_copy_backs_up_existing_target_cache() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("voxy-copy-template")?;
         let target = TempDir::new("voxy-copy-target")?;
         create_voxy_world(template.path(), "example.com", "template")?;
@@ -503,6 +376,7 @@ mod tests {
             template.path(),
             target.path(),
             &CacheTransfer::Copy,
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 
@@ -522,6 +396,7 @@ mod tests {
 
     #[test]
     fn voxy_link_to_source_replaces_existing_target_with_junction() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("voxy-link-template")?;
         let target = TempDir::new("voxy-link-target")?;
         let source_world = create_voxy_world(template.path(), "example.com", "template")?;
@@ -532,6 +407,7 @@ mod tests {
             template.path(),
             target.path(),
             &CacheTransfer::LinkToSource,
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 
@@ -547,18 +423,20 @@ mod tests {
 
     #[test]
     fn voxy_link_to_shared_moves_source_and_links_both() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("voxy-shared-template")?;
         let target = TempDir::new("voxy-shared-target")?;
         let next_target = TempDir::new("voxy-shared-next")?;
         let shared = TempDir::new("voxy-shared-store")?;
         let source_world = create_voxy_world(template.path(), "example.com", "template")?;
         let method = CacheTransfer::LinkToShared(shared.path().to_path_buf());
-        let transfer = |target_dir: &Path| {
+        let mut transfer = |target_dir: &Path| {
             transfer_server_caches(
                 ServerCache::Voxy,
                 template.path(),
                 target_dir,
                 &method,
+                &mut journal,
                 &mut LogSink::new(&mut |_| {}),
             )
         };
@@ -588,6 +466,7 @@ mod tests {
 
     #[test]
     fn voxy_and_bobby_share_one_root_without_conflict() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("both-shared-template")?;
         let target = TempDir::new("both-shared-target")?;
         let shared = TempDir::new("both-shared-store")?;
@@ -601,6 +480,7 @@ mod tests {
                 template.path(),
                 target.path(),
                 &method,
+                &mut journal,
                 &mut LogSink::new(&mut |_| {}),
             )?;
             assert!(result.warnings.is_empty(), "{kind}: {:?}", result.warnings);
@@ -625,6 +505,7 @@ mod tests {
 
     #[test]
     fn voxy_copy_refuses_cache_held_by_running_game() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("voxy-lock-template")?;
         let target = TempDir::new("voxy-lock-target")?;
         let source_world = create_voxy_world(template.path(), "example.com", "template")?;
@@ -639,6 +520,7 @@ mod tests {
             template.path(),
             target.path(),
             &CacheTransfer::Copy,
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 
@@ -650,6 +532,7 @@ mod tests {
 
     #[test]
     fn bobby_copy_refuses_region_file_opened_with_shared_access() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let template = TempDir::new("bobby-lock-template")?;
         let target = TempDir::new("bobby-lock-target")?;
         let server = create_bobby_server(template.path(), "example.com")?;
@@ -664,6 +547,7 @@ mod tests {
             template.path(),
             target.path(),
             &CacheTransfer::Copy,
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 

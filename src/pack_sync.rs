@@ -1,16 +1,13 @@
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use walkdir::WalkDir;
 
-use crate::map_sync::{
-    copy_dir_recursive, create_junction, ensure_cache_not_in_use, is_link, move_dir, rename_aside,
-    resolve_real_path,
-};
+use crate::fs_ops::{ensure_cache_not_in_use, is_link, resolve_real_path, unix_seconds};
+use crate::journal::Journal;
 use crate::types::{
     ConflictChoice, DetectedInstance, LogSink, MigrationResult, PackConflict, PackTransfer,
     PackVersion, SharedAsset,
@@ -64,24 +61,42 @@ fn is_asset_entry(kind: SharedAsset, path: &Path) -> bool {
     }
 }
 
-/// 按 `method` 同步模板与目标实例的 `kind` 资源，同名且内容不同的条目由 `resolve` 交给用户决定。
-///
-/// `max_data_version` 不为空时，复制模式只放入数据版本号不超过该值的蓝图，避免目标版本加载新版本蓝图时崩溃。
+/// 一次资源同步的输入。
+pub struct AssetSyncRequest<'a> {
+    pub kind: SharedAsset,
+    pub template: &'a DetectedInstance,
+    pub target: &'a DetectedInstance,
+    pub method: &'a PackTransfer,
+    /// 不为空时，复制模式只放入数据版本号不超过该值的蓝图，避免目标版本加载新版本蓝图时崩溃。
+    pub max_data_version: Option<i64>,
+}
+
+/// 按 `request.method` 同步模板与目标实例的资源，同名且内容不同的条目由 `resolve` 交给用户决定。
 pub fn sync_shared_assets(
-    kind: SharedAsset,
-    template: &DetectedInstance,
-    target: &DetectedInstance,
-    method: &PackTransfer,
-    max_data_version: Option<i64>,
+    request: &AssetSyncRequest,
     resolve: &mut ConflictResolver,
+    journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<AssetSyncOutcome> {
+    let AssetSyncRequest {
+        kind,
+        template,
+        target,
+        method,
+        max_data_version,
+    } = *request;
     match method {
-        PackTransfer::CopyMissing => {
-            copy_missing_assets(kind, template, target, max_data_version, resolve, log)
-        }
+        PackTransfer::CopyMissing => copy_missing_assets(
+            kind,
+            template,
+            target,
+            max_data_version,
+            resolve,
+            journal,
+            log,
+        ),
         PackTransfer::LinkToShared(shared_root) => {
-            link_assets_to_shared(kind, template, target, shared_root, resolve, log)
+            link_assets_to_shared(kind, template, target, shared_root, resolve, journal, log)
         }
     }
 }
@@ -92,6 +107,7 @@ fn copy_missing_assets(
     target: &DetectedInstance,
     max_data_version: Option<i64>,
     resolve: &mut ConflictResolver,
+    journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<AssetSyncOutcome> {
     let mut outcome = AssetSyncOutcome::default();
@@ -132,7 +148,7 @@ fn copy_missing_assets(
 
     let mut added = Vec::new();
     for (name, source, destination) in missing {
-        copy_entry(&source, &destination)?;
+        journal.copy_entry(&source, &destination)?;
         outcome.result.changed_paths.push(destination);
         added.push(name);
     }
@@ -142,8 +158,8 @@ fn copy_missing_assets(
             continue;
         }
         ensure_cache_not_in_use(&conflict.existing)?;
-        let backup = move_to_backup(&conflict.existing, &backup_dir)?;
-        copy_entry(&conflict.incoming, &conflict.existing)?;
+        let backup = move_to_backup(&conflict.existing, &backup_dir, journal)?;
+        journal.copy_entry(&conflict.incoming, &conflict.existing)?;
         log.success(format!(
             "{kind}：{} 已替换为模板版本，原版本移至 {}",
             conflict.name,
@@ -176,13 +192,15 @@ fn link_assets_to_shared(
     target: &DetectedInstance,
     shared_root: &Path,
     resolve: &mut ConflictResolver,
+    journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<AssetSyncOutcome> {
     let mut outcome = AssetSyncOutcome::default();
     let shared = shared_root.join(shared_subdir(kind));
     // 先处理模板，使共享目录第一次创建时以模板的内容为准
     for instance in [template, target] {
-        let linked = link_instance_assets(kind, instance, &shared, shared_root, resolve, log)?;
+        let linked =
+            link_instance_assets(kind, instance, &shared, shared_root, resolve, journal, log)?;
         if let Some(added) = linked {
             outcome
                 .result
@@ -201,6 +219,7 @@ fn link_instance_assets(
     shared: &Path,
     shared_root: &Path,
     resolve: &mut ConflictResolver,
+    journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<Option<Vec<String>>> {
     let instance_dir = instance.game_dir.join(asset_dir(kind));
@@ -225,20 +244,12 @@ fn link_instance_assets(
         }
         ensure_cache_not_in_use(&instance_dir)?;
         if shared.exists() {
-            added = merge_into_shared(
-                kind,
-                instance,
-                &instance_dir,
-                shared,
-                shared_root,
-                resolve,
-                log,
-            )?;
-            set_aside_leftovers(kind, &instance_dir, log)?;
+            added = merge_into_shared(kind, instance, shared, shared_root, resolve, journal, log)?;
+            set_aside_leftovers(kind, &instance_dir, journal, log)?;
         } else {
             fs::create_dir_all(shared_root)
                 .with_context(|| format!("创建目录 {} 失败", shared_root.display()))?;
-            move_dir(&instance_dir, shared)?;
+            journal.move_path(&instance_dir, shared)?;
             log.success(format!(
                 "{kind}：已将 {} 的内容移动到 {}",
                 instance.name,
@@ -254,13 +265,15 @@ fn link_instance_assets(
         }
     }
 
-    create_junction(&instance_dir, shared).with_context(|| {
-        format!(
-            "{kind}已位于 {}，但 {} 的链接建立失败",
-            shared.display(),
-            instance.name
-        )
-    })?;
+    journal
+        .create_junction(&instance_dir, shared)
+        .with_context(|| {
+            format!(
+                "{kind}已位于 {}，但 {} 的链接建立失败",
+                shared.display(),
+                instance.name
+            )
+        })?;
     log.success(format!(
         "{kind}：{} → {}",
         instance_dir.display(),
@@ -272,15 +285,16 @@ fn link_instance_assets(
 fn merge_into_shared(
     kind: SharedAsset,
     instance: &DetectedInstance,
-    instance_dir: &Path,
     shared: &Path,
     shared_root: &Path,
     resolve: &mut ConflictResolver,
+    journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<Vec<String>> {
+    let instance_dir = instance.game_dir.join(asset_dir(kind));
     let mut moves = Vec::new();
     let mut conflicts = Vec::new();
-    for (name, path) in list_assets(kind, instance_dir)? {
+    for (name, path) in list_assets(kind, &instance_dir)? {
         let destination = shared.join(&name);
         if !destination.exists() {
             moves.push((name, path, destination));
@@ -296,7 +310,7 @@ fn merge_into_shared(
 
     let mut added = Vec::new();
     for (name, path, destination) in moves {
-        move_dir(&path, &destination)?;
+        journal.move_path(&path, &destination)?;
         added.push(name);
     }
     let backup_dir = shared_root.join(format!("{}.bak", shared_subdir(kind)));
@@ -305,8 +319,8 @@ fn merge_into_shared(
             continue;
         }
         ensure_cache_not_in_use(&conflict.existing)?;
-        let backup = move_to_backup(&conflict.existing, &backup_dir)?;
-        move_dir(&conflict.incoming, &conflict.existing)?;
+        let backup = move_to_backup(&conflict.existing, &backup_dir, journal)?;
+        journal.move_path(&conflict.incoming, &conflict.existing)?;
         log.success(format!(
             "{kind}：共享目录中的 {} 已替换为 {} 的版本，原版本移至 {}",
             conflict.name,
@@ -323,16 +337,20 @@ fn merge_into_shared(
 }
 
 /// 合并后实例目录中剩下的是与共享目录相同、用户选择保留共享版本或不属于资源条目的文件，整体改名保留。
-fn set_aside_leftovers(kind: SharedAsset, instance_dir: &Path, log: &mut LogSink) -> Result<()> {
+fn set_aside_leftovers(
+    kind: SharedAsset,
+    instance_dir: &Path,
+    journal: &mut Journal,
+    log: &mut LogSink,
+) -> Result<()> {
     let is_empty = fs::read_dir(instance_dir)
         .with_context(|| format!("读取目录 {} 失败", instance_dir.display()))?
         .next()
         .is_none();
     if is_empty {
-        fs::remove_dir(instance_dir)
-            .with_context(|| format!("删除空目录 {} 失败", instance_dir.display()))?;
+        journal.remove_empty_dir(instance_dir)?;
     } else {
-        let backup = rename_aside(instance_dir)?;
+        let backup = journal.rename_aside(instance_dir)?;
         log.info(format!(
             "{kind}：未并入的原有文件保留在 {}",
             backup.display()
@@ -466,38 +484,20 @@ fn list_assets(kind: SharedAsset, dir: &Path) -> Result<Vec<(String, PathBuf)>> 
     Ok(entries)
 }
 
-fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
-    if source.is_dir() {
-        copy_dir_recursive(source, destination)
-    } else {
-        fs::copy(source, destination).map(|_| ()).with_context(|| {
-            format!(
-                "复制 {} 到 {} 失败",
-                source.display(),
-                destination.display()
-            )
-        })
-    }
-}
-
 fn file_name_of(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
-fn move_to_backup(path: &Path, backup_dir: &Path) -> Result<PathBuf> {
+fn move_to_backup(path: &Path, backup_dir: &Path, journal: &mut Journal) -> Result<PathBuf> {
     fs::create_dir_all(backup_dir)
         .with_context(|| format!("创建目录 {} 失败", backup_dir.display()))?;
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("系统时间早于 1970 年")?
-        .as_secs();
-    let backup = backup_dir.join(format!("{}.{seconds}", file_name_of(path)));
+    let backup = backup_dir.join(format!("{}.{}", file_name_of(path), unix_seconds()?));
     if backup.exists() {
         bail!("备份 {} 已存在", backup.display());
     }
-    move_dir(path, &backup)?;
+    journal.move_path(path, &backup)?;
     Ok(backup)
 }
 
@@ -569,7 +569,7 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_support::{TempDir, test_journal};
     use crate::types::LauncherKind;
 
     fn instance(dir: &TempDir, name: &str) -> DetectedInstance {
@@ -632,6 +632,7 @@ mod tests {
 
     #[test]
     fn copy_missing_copies_new_packs_and_asks_only_for_different_ones() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let kind = SharedAsset::ResourcePacks;
         let template_dir = TempDir::new("packs-copy-template")?;
         let target_dir = TempDir::new("packs-copy-target")?;
@@ -652,12 +653,15 @@ mod tests {
 
         let mut seen = Vec::new();
         let outcome = sync_shared_assets(
-            kind,
-            &template,
-            &target,
-            &PackTransfer::CopyMissing,
-            None,
+            &AssetSyncRequest {
+                kind,
+                template: &template,
+                target: &target,
+                method: &PackTransfer::CopyMissing,
+                max_data_version: None,
+            },
             &mut answer_all(ConflictChoice::UseIncoming, &mut seen),
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 
@@ -678,6 +682,7 @@ mod tests {
 
     #[test]
     fn copy_missing_keeps_existing_when_user_chooses_so() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let kind = SharedAsset::ResourcePacks;
         let template_dir = TempDir::new("packs-keep-template")?;
         let target_dir = TempDir::new("packs-keep-target")?;
@@ -686,12 +691,15 @@ mod tests {
 
         let mut seen = Vec::new();
         sync_shared_assets(
-            kind,
-            &instance(&template_dir, "旧包"),
-            &instance(&target_dir, "新包"),
-            &PackTransfer::CopyMissing,
-            None,
+            &AssetSyncRequest {
+                kind,
+                template: &instance(&template_dir, "旧包"),
+                target: &instance(&target_dir, "新包"),
+                method: &PackTransfer::CopyMissing,
+                max_data_version: None,
+            },
             &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 
@@ -702,6 +710,7 @@ mod tests {
 
     #[test]
     fn link_to_shared_merges_both_instances_and_links_them() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let kind = SharedAsset::ResourcePacks;
         let template_dir = TempDir::new("packs-shared-template")?;
         let target_dir = TempDir::new("packs-shared-target")?;
@@ -716,12 +725,15 @@ mod tests {
 
         let mut seen = Vec::new();
         let outcome = sync_shared_assets(
-            kind,
-            &instance(&template_dir, "旧包"),
-            &instance(&target_dir, "新包"),
-            &PackTransfer::LinkToShared(shared_root.path().to_path_buf()),
-            None,
+            &AssetSyncRequest {
+                kind,
+                template: &instance(&template_dir, "旧包"),
+                target: &instance(&target_dir, "新包"),
+                method: &PackTransfer::LinkToShared(shared_root.path().to_path_buf()),
+                max_data_version: None,
+            },
             &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 
@@ -770,6 +782,7 @@ mod tests {
 
     #[test]
     fn screenshots_link_to_shared_keeps_files_visible_from_both_instances() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let kind = SharedAsset::Screenshots;
         let template_dir = TempDir::new("shots-template")?;
         let target_dir = TempDir::new("shots-target")?;
@@ -779,12 +792,15 @@ mod tests {
 
         let mut seen = Vec::new();
         sync_shared_assets(
-            kind,
-            &instance(&template_dir, "旧包"),
-            &instance(&target_dir, "新包"),
-            &PackTransfer::LinkToShared(shared_root.path().to_path_buf()),
-            None,
+            &AssetSyncRequest {
+                kind,
+                template: &instance(&template_dir, "旧包"),
+                target: &instance(&target_dir, "新包"),
+                method: &PackTransfer::LinkToShared(shared_root.path().to_path_buf()),
+                max_data_version: None,
+            },
             &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 
@@ -812,6 +828,7 @@ mod tests {
 
     #[test]
     fn blueprint_copy_skips_newer_versions_and_ignores_ordering_file() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let kind = SharedAsset::AxiomBlueprints;
         let template_dir = TempDir::new("bp-copy-template")?;
         let target_dir = TempDir::new("bp-copy-target")?;
@@ -837,12 +854,15 @@ mod tests {
 
         let mut seen = Vec::new();
         let outcome = sync_shared_assets(
-            kind,
-            &instance(&template_dir, "26.3"),
-            &instance(&target_dir, "26.2"),
-            &PackTransfer::CopyMissing,
-            Some(4903),
+            &AssetSyncRequest {
+                kind,
+                template: &instance(&template_dir, "26.3"),
+                target: &instance(&target_dir, "26.2"),
+                method: &PackTransfer::CopyMissing,
+                max_data_version: Some(4903),
+            },
             &mut answer_all(ConflictChoice::UseIncoming, &mut seen),
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 
@@ -860,6 +880,7 @@ mod tests {
 
     #[test]
     fn blueprint_conflict_reports_data_versions() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
         let kind = SharedAsset::AxiomBlueprints;
         let template_dir = TempDir::new("bp-conflict-template")?;
         let target_dir = TempDir::new("bp-conflict-target")?;
@@ -878,12 +899,15 @@ mod tests {
 
         let mut seen = Vec::new();
         sync_shared_assets(
-            kind,
-            &instance(&template_dir, "旧包"),
-            &instance(&target_dir, "新包"),
-            &PackTransfer::CopyMissing,
-            Some(4903),
+            &AssetSyncRequest {
+                kind,
+                template: &instance(&template_dir, "旧包"),
+                target: &instance(&target_dir, "新包"),
+                method: &PackTransfer::CopyMissing,
+                max_data_version: Some(4903),
+            },
             &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
+            &mut journal,
             &mut LogSink::new(&mut |_| {}),
         )?;
 

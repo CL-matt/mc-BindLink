@@ -1790,6 +1790,7 @@ dependencies = [
  "flate2",
  "image",
  "rfd",
+ "serde",
  "serde_json",
  "toml_edit",
  "walkdir",
