@@ -165,7 +165,7 @@
 - `src/map_sync.rs`: 地图路点目录递归同步与 Voxy、Bobby 缓存链接或拷贝；同时提供 Junction、移动、占用检测等目录操作供 `pack_sync.rs` 复用。
 - `src/pack_sync.rs`: 材质包、Axiom 蓝图与截图的复制、合并到共享目录、同名冲突处理，以及蓝图数据版本读取。
 - `src/journal.rs`: 迁移记录与回退，迁移中所有改动文件系统的操作都经由其中的 `Journal` 执行。
-- `src/log_file.rs`: 把界面日志同时写入 `%APPDATA%\BindLink\logsindlink-<毫秒时间戳>.log`，每次启动一个文件，保留最近 20 个；时间统一用 UTC；日志区"清空"按钮左侧的"打开日志文件夹"用资源管理器打开该目录。界面中的所有日志都必须经由 `add_logs` 进入，保证与文件一致。
+- `src/log_file.rs`: 把界面日志同时写入 `%APPDATA%\BindLink\logs\bindlink-<毫秒时间戳>.log`，每次启动一个文件，保留最近 20 个；时间统一用 UTC；日志区"清空"按钮左侧的"打开日志文件夹"用资源管理器打开该目录。界面中的所有日志都必须经由 `add_logs` 进入，保证与文件一致。
 - `src/fs_ops.rs`: 不经过迁移记录的文件系统基础操作（路径解析、占用检测、目录移动、Junction 创建），供 `journal.rs`、`map_sync.rs`、`pack_sync.rs` 使用。
 - `src/types.rs`: 全局公用枚举与数据结构定义。
 
