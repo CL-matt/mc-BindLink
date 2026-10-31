@@ -100,6 +100,8 @@ pub struct MigrationRequest {
     pub axiom_blueprints: Option<PackTransfer>,
     /// 为 `None` 时不处理截图。
     pub screenshots: Option<PackTransfer>,
+    /// 迁移结束后对比两个实例的 Mod 列表，结果放入 `MigrationResult::mod_diff`。
+    pub report_mod_changes: bool,
 }
 
 /// 可复制或通过共享目录共用的玩家资源，冲突处理规则相同。
@@ -219,6 +221,30 @@ impl<'a> LogSink<'a> {
     }
 }
 
+/// 一个已安装的 Mod；元数据与 jar 清单都没有版本号时为"未知"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModEntry {
+    pub id: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModVersionChange {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// 模板（旧）与目标（新）实例按 Mod ID 对比的结果，各列表按 ID 排序。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModDiff {
+    pub changed: Vec<ModVersionChange>,
+    /// 只在目标实例中存在。
+    pub added: Vec<ModEntry>,
+    /// 只在模板实例中存在。
+    pub removed: Vec<ModEntry>,
+}
+
 /// 一次迁移的执行结果，供界面汇总展示。
 #[derive(Debug, Default)]
 pub struct MigrationResult {
@@ -226,6 +252,8 @@ pub struct MigrationResult {
     pub changed_paths: Vec<PathBuf>,
     /// 被跳过但不影响其他步骤的问题。
     pub warnings: Vec<String>,
+    /// 请求了 Mod 对比且对比成功时才有值。
+    pub mod_diff: Option<ModDiff>,
 }
 
 /// 一条尚未回退的迁移记录，供界面列出迁移历史。

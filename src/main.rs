@@ -24,8 +24,8 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::types::{
     CacheTransfer, ConflictChoice, DetectedInstance, HistoryEntry, LogEntry, LogLevel, LogSink,
-    MigrationRequest, MigrationResult, PackConflict, PackTransfer, PackVersion, ServerCache,
-    SharedAsset, SyncMode,
+    MigrationRequest, MigrationResult, ModDiff, PackConflict, PackTransfer, PackVersion,
+    ServerCache, SharedAsset, SyncMode,
 };
 
 const CJK_FONT_NAME: &str = "msyh";
@@ -82,6 +82,13 @@ enum WorkerMessage {
     /// 后台线程遇到材质包或蓝图同名冲突，阻塞等待界面通过附带的发送端回传用户选择。
     Conflicts(Vec<PackConflict>, Sender<Vec<ConflictChoice>>),
     Finished(Result<MigrationResult>),
+}
+
+/// 使用固定配置完成迁移后展示的 Mod 变化。
+struct ModDiffDialog {
+    template: String,
+    target: String,
+    diff: ModDiff,
 }
 
 struct ConflictDialog {
@@ -242,6 +249,11 @@ struct MigratorApp {
     /// 尚未回退的迁移记录，最新的在前。
     history: Vec<HistoryEntry>,
     confirm_rollback: bool,
+    /// 点击过固定配置按钮后为 `true`，此后的迁移结束时对比并展示 Mod 变化。
+    preset_applied: bool,
+    /// 正在进行的迁移的模板与目标实例名，用于 Mod 变化窗口的标题。
+    running_pair: Option<(String, String)>,
+    mod_diff_dialog: Option<ModDiffDialog>,
     worker: Option<Receiver<WorkerMessage>>,
     conflict_dialog: Option<ConflictDialog>,
     /// 未编译进图标或解码失败时为 `None`，标题栏改为只显示文字链接。
@@ -274,6 +286,9 @@ impl MigratorApp {
             history_root: None,
             history: Vec::new(),
             confirm_rollback: false,
+            preset_applied: false,
+            running_pair: None,
+            mod_diff_dialog: None,
             worker: None,
             conflict_dialog: None,
             lorian_logo: None,
@@ -438,6 +453,7 @@ impl MigratorApp {
             resource_packs,
             axiom_blueprints,
             screenshots,
+            report_mod_changes: self.preset_applied,
         })
     }
 
@@ -453,6 +469,7 @@ impl MigratorApp {
             self.push_log(LogLevel::Error, "无法记录迁移，已取消");
             return;
         };
+        self.running_pair = Some((request.template.name.clone(), request.target.name.clone()));
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         // 复制 Voxy 或 Bobby 缓存可能耗时数分钟，放到后台线程以免阻塞界面
@@ -544,6 +561,16 @@ impl MigratorApp {
         self.worker = None;
         self.refresh_history();
         let task = self.task.label();
+        if let Ok(result) = &outcome
+            && let Some(diff) = &result.mod_diff
+            && let Some((template, target)) = self.running_pair.take()
+        {
+            self.mod_diff_dialog = Some(ModDiffDialog {
+                template,
+                target,
+                diff: diff.clone(),
+            });
+        }
         match outcome {
             Ok(result) if result.warnings.is_empty() => {
                 self.push_log(LogLevel::Success, format!("{task}完成"));
@@ -572,6 +599,7 @@ impl MigratorApp {
         self.voxy_choice = preset.cache_choice;
         self.bobby_choice = preset.cache_choice;
         self.blueprint_choice = PackChoice::Skip;
+        self.preset_applied = true;
         self.screenshot_choice = PackChoice::LinkToShared;
         self.push_log(LogLevel::Info, format!("已应用固定配置：{}", preset.name));
     }
@@ -912,6 +940,67 @@ impl MigratorApp {
         }
     }
 
+    fn show_mod_diff_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &self.mod_diff_dialog else {
+            return;
+        };
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique("mod_diff")).show(ctx, |ui| {
+            ui.set_max_width(620.0);
+            ui.label(RichText::new("Mod 变化").size(18.0).strong());
+            ui.label(format!("{} → {}", dialog.template, dialog.target));
+            let diff = &dialog.diff;
+            ui.label(
+                RichText::new(format!(
+                    "版本变化 {} 个 · 新增 {} 个 · 移除 {} 个",
+                    diff.changed.len(),
+                    diff.added.len(),
+                    diff.removed.len()
+                ))
+                .weak(),
+            );
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    mod_section(ui, "版本变化", diff.changed.len(), |ui| {
+                        for change in &diff.changed {
+                            ui.label(&change.id);
+                            ui.label(format!("{} → {}", change.from, change.to));
+                            ui.end_row();
+                        }
+                    });
+                    mod_section(ui, "新增", diff.added.len(), |ui| {
+                        for entry in &diff.added {
+                            ui.label(
+                                RichText::new(&entry.id).color(log_color(ui, LogLevel::Success)),
+                            );
+                            ui.label(&entry.version);
+                            ui.end_row();
+                        }
+                    });
+                    mod_section(ui, "移除", diff.removed.len(), |ui| {
+                        for entry in &diff.removed {
+                            ui.label(
+                                RichText::new(&entry.id).color(log_color(ui, LogLevel::Error)),
+                            );
+                            ui.label(&entry.version);
+                            ui.end_row();
+                        }
+                    });
+                });
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("关闭").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.mod_diff_dialog = None;
+        }
+    }
+
     fn show_conflict_dialog(&mut self, ctx: &egui::Context) {
         let Some(dialog) = &mut self.conflict_dialog else {
             return;
@@ -997,6 +1086,7 @@ impl eframe::App for MigratorApp {
         });
         self.show_conflict_dialog(&ctx);
         self.show_rollback_confirm(&ctx);
+        self.show_mod_diff_dialog(&ctx);
     }
 }
 
@@ -1038,6 +1128,22 @@ fn load_logo_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Result<eg
     let size = [rgba.width() as usize, rgba.height() as usize];
     let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
     Ok(ctx.load_texture(name, pixels, egui::TextureOptions::LINEAR))
+}
+
+/// Mod 变化窗口中的一个可折叠分组，内容为"ID / 版本"两列表格。
+fn mod_section(ui: &mut egui::Ui, title: &str, count: usize, add_rows: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new(format!("{title}（{count}）"))
+        .default_open(count > 0)
+        .show(ui, |ui| {
+            if count == 0 {
+                ui.label(RichText::new("无").weak());
+                return;
+            }
+            egui::Grid::new(format!("mod_diff_{title}"))
+                .num_columns(2)
+                .striped(true)
+                .show(ui, add_rows);
+        });
 }
 
 fn card_frame(ui: &egui::Ui) -> egui::Frame {

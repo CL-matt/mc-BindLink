@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
@@ -14,7 +14,8 @@ use crate::journal::Journal;
 use crate::map_sync;
 use crate::pack_sync::{self, AssetSyncRequest, ConflictResolver};
 use crate::types::{
-    LogSink, MigrationRequest, MigrationResult, PackTransfer, ServerCache, SharedAsset, SyncMode,
+    LogSink, MigrationRequest, MigrationResult, ModDiff, ModEntry, ModVersionChange, PackTransfer,
+    ServerCache, SharedAsset, SyncMode,
 };
 
 const OPTIONS_FILE_NAME: &str = "options.txt";
@@ -166,8 +167,72 @@ pub fn run_migration(
         result.changed_paths.len(),
         result.warnings.len()
     ));
+    if request.report_mod_changes {
+        match diff_installed_mods(template_dir, target_dir, log) {
+            Ok(diff) => {
+                log_mod_diff(&diff, log);
+                result.mod_diff = Some(diff);
+            }
+            Err(err) => record_step_failure("Mod 变化对比", Err(err), log, &mut result),
+        }
+    }
     journal.finish()?;
     Ok(result)
+}
+
+/// 按 Mod ID 对比模板（旧）与目标（新）实例 `mods/` 中的 Mod。
+pub fn diff_installed_mods(
+    template_dir: &Path,
+    target_dir: &Path,
+    log: &mut LogSink,
+) -> Result<ModDiff> {
+    let old = scan_installed_mods(&template_dir.join("mods"), log)?;
+    let new = scan_installed_mods(&target_dir.join("mods"), log)?;
+    let mut diff = ModDiff::default();
+    for (id, from) in &old {
+        match new.get(id) {
+            Some(to) if to != from => diff.changed.push(ModVersionChange {
+                id: id.clone(),
+                from: from.clone(),
+                to: to.clone(),
+            }),
+            Some(_) => {}
+            None => diff.removed.push(ModEntry {
+                id: id.clone(),
+                version: from.clone(),
+            }),
+        }
+    }
+    for (id, version) in &new {
+        if !old.contains_key(id) {
+            diff.added.push(ModEntry {
+                id: id.clone(),
+                version: version.clone(),
+            });
+        }
+    }
+    Ok(diff)
+}
+
+fn log_mod_diff(diff: &ModDiff, log: &mut LogSink) {
+    log.info(format!(
+        "Mod 变化：版本变化 {} 个，新增 {} 个，移除 {} 个",
+        diff.changed.len(),
+        diff.added.len(),
+        diff.removed.len()
+    ));
+    for change in &diff.changed {
+        log.info(format!(
+            "  版本变化 {}：{} → {}",
+            change.id, change.from, change.to
+        ));
+    }
+    for entry in &diff.added {
+        log.info(format!("  新增 {} {}", entry.id, entry.version));
+    }
+    for entry in &diff.removed {
+        log.info(format!("  移除 {} {}", entry.id, entry.version));
+    }
 }
 
 fn record_step_failure(
@@ -582,12 +647,17 @@ fn append_blueprint_ordering(
 }
 
 /// 读取 `mods_dir` 下所有 `.jar` 的元数据并返回 Mod ID 集合。
+pub fn detect_installed_mod_ids(mods_dir: &Path, log: &mut LogSink) -> Result<HashSet<String>> {
+    Ok(scan_installed_mods(mods_dir, log)?.into_keys().collect())
+}
+
+/// 读取 `mods_dir` 下所有 `.jar` 的元数据，返回按 ID 排序的 Mod 与版本号。
 ///
 /// 损坏的压缩包与不规范的元数据只记录日志并跳过，不会中断扫描。
-pub fn detect_installed_mod_ids(mods_dir: &Path, log: &mut LogSink) -> Result<HashSet<String>> {
-    let mut ids = HashSet::new();
+pub fn scan_installed_mods(mods_dir: &Path, log: &mut LogSink) -> Result<BTreeMap<String, String>> {
+    let mut mods = BTreeMap::new();
     if !mods_dir.is_dir() {
-        return Ok(ids);
+        return Ok(mods);
     }
     for entry in
         fs::read_dir(mods_dir).with_context(|| format!("读取目录 {} 失败", mods_dir.display()))?
@@ -606,24 +676,28 @@ pub fn detect_installed_mod_ids(mods_dir: &Path, log: &mut LogSink) -> Result<Ha
             continue;
         }
         match read_mod_ids_from_jar(&path) {
-            Ok(metadata) if metadata.ids.is_empty() && metadata.problems.is_empty() => {
+            Ok(metadata) if metadata.mods.is_empty() && metadata.problems.is_empty() => {
                 log.skip(format!("未在 {} 中找到 Mod 元数据", path.display()));
             }
-            Ok(metadata) if metadata.ids.is_empty() => log.warn(format!(
+            Ok(metadata) if metadata.mods.is_empty() => log.warn(format!(
                 "跳过无法解析的 Mod 文件 {}：{}",
                 path.display(),
                 metadata.problems.join("；")
             )),
             Ok(metadata) => {
                 if !metadata.problems.is_empty() {
+                    let ids: Vec<&str> = metadata.mods.iter().map(|m| m.id.as_str()).collect();
                     log.skip(format!(
                         "{}：已识别 {}，忽略无法解析的元数据（{}）",
                         path.display(),
-                        metadata.ids.join("、"),
+                        ids.join("、"),
                         metadata.problems.join("；")
                     ));
                 }
-                ids.extend(metadata.ids);
+                for found in metadata.mods {
+                    let version = found.version.unwrap_or_else(|| UNKNOWN_VERSION.to_string());
+                    mods.entry(found.id).or_insert(version);
+                }
             }
             Err(err) => log.warn(format!(
                 "跳过无法解析的 Mod 文件 {}：{err:#}",
@@ -631,18 +705,39 @@ pub fn detect_installed_mod_ids(mods_dir: &Path, log: &mut LogSink) -> Result<Ha
             )),
         }
     }
-    Ok(ids)
+    Ok(mods)
+}
+
+const UNKNOWN_VERSION: &str = "未知";
+
+/// 从一份元数据中读到的 Mod。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModMetadata {
+    id: String,
+    /// 缺失或仍是 `${...}` 占位符时为 `None`。
+    version: Option<String>,
+}
+
+impl ModMetadata {
+    fn new(id: &str, version: Option<&str>) -> Self {
+        Self {
+            id: id.to_string(),
+            version: version
+                .filter(|v| !v.is_empty() && !v.contains('$'))
+                .map(str::to_string),
+        }
+    }
 }
 
 /// 单个 jar 的元数据读取结果。
 #[derive(Debug, Default)]
 struct JarMetadata {
-    ids: Vec<String>,
+    mods: Vec<ModMetadata>,
     /// 无法读取或解析的元数据文件及原因。
     problems: Vec<String>,
 }
 
-type MetadataParser = fn(&str) -> Result<Vec<String>>;
+type MetadataParser = fn(&str) -> Result<Vec<ModMetadata>>;
 
 /// 各加载器的元数据文件及其解析函数。
 const METADATA_PARSERS: &[(&str, MetadataParser)] = &[
@@ -663,31 +758,59 @@ fn read_mod_ids_from_jar(path: &Path) -> Result<JarMetadata> {
         let parsed = read_zip_text(&mut archive, name)
             .and_then(|text| text.map(|text| parse(&text)).transpose());
         match parsed {
-            Ok(Some(ids)) => metadata.ids.extend(ids),
+            Ok(Some(mods)) => {
+                for found in mods {
+                    if !metadata.mods.iter().any(|m| m.id == found.id) {
+                        metadata.mods.push(found);
+                    }
+                }
+            }
             Ok(None) => {}
             Err(err) => metadata.problems.push(format!("{name} 格式错误：{err:#}")),
         }
     }
-    metadata.ids.dedup();
+    // Forge 的版本号常写成 `${file.jarVersion}`，实际值由构建工具写在 jar 清单中
+    if metadata.mods.iter().any(|m| m.version.is_none())
+        && let Ok(Some(manifest)) = read_zip_text(&mut archive, "META-INF/MANIFEST.MF")
+        && let Some(version) = manifest_implementation_version(&manifest)
+    {
+        for found in metadata.mods.iter_mut().filter(|m| m.version.is_none()) {
+            found.version = Some(version.clone());
+        }
+    }
     Ok(metadata)
 }
 
-fn parse_fabric_mod_ids(text: &str) -> Result<Vec<String>> {
+fn manifest_implementation_version(manifest: &str) -> Option<String> {
+    manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("Implementation-Version:"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && !value.contains('$'))
+}
+
+fn parse_fabric_mod_ids(text: &str) -> Result<Vec<ModMetadata>> {
     let json = parse_mod_metadata_json(text)?;
     Ok(json
         .get("id")
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .map(|id| ModMetadata::new(id, json.get("version").and_then(Value::as_str)))
         .into_iter()
         .collect())
 }
 
-fn parse_quilt_mod_ids(text: &str) -> Result<Vec<String>> {
+fn parse_quilt_mod_ids(text: &str) -> Result<Vec<ModMetadata>> {
     let json = parse_mod_metadata_json(text)?;
     Ok(json
         .pointer("/quilt_loader/id")
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .map(|id| {
+            ModMetadata::new(
+                id,
+                json.pointer("/quilt_loader/version")
+                    .and_then(Value::as_str),
+            )
+        })
         .into_iter()
         .collect())
 }
@@ -744,7 +867,7 @@ fn parse_json_text(text: &str) -> Result<Value> {
 }
 
 /// 解析 `mods.toml`；整份文件因残留占位符等原因无法解析时，退回逐行查找 `[[mods]]` 下的 `modId`。
-fn parse_forge_mod_ids(text: &str) -> Result<Vec<String>> {
+fn parse_forge_mod_ids(text: &str) -> Result<Vec<ModMetadata>> {
     let document: DocumentMut = match text.parse() {
         Ok(document) => document,
         Err(err) => {
@@ -764,34 +887,52 @@ fn parse_forge_mod_ids(text: &str) -> Result<Vec<String>> {
     // 未经构建替换的 `${mod_id}` 占位符不是真实 ID
     Ok(mods
         .iter()
-        .filter_map(|table| table.get("modId").and_then(|item| item.as_str()))
-        .filter(|id| !id.contains('$'))
-        .map(str::to_string)
+        .filter_map(|table| {
+            let id = table.get("modId").and_then(|item| item.as_str())?;
+            let version = table.get("version").and_then(|item| item.as_str());
+            (!id.contains('$')).then(|| ModMetadata::new(id, version))
+        })
         .collect())
 }
 
-fn scan_forge_mod_ids(text: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut in_mods_table = false;
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_mods_table = line == "[[mods]]";
-            continue;
-        }
-        let value = line
-            .strip_prefix("modId")
-            .map(str::trim_start)
-            .and_then(|rest| rest.strip_prefix('='))
-            .map(|value| value.trim().trim_matches(['"', '\'']));
-        if in_mods_table
-            && let Some(id) = value
-            && !id.is_empty()
+fn scan_forge_mod_ids(text: &str) -> Vec<ModMetadata> {
+    let mut mods = Vec::new();
+    let mut current: Option<(Option<String>, Option<String>)> = None;
+    let mut finish = |entry: Option<(Option<String>, Option<String>)>| {
+        if let Some((Some(id), version)) = entry
             && !id.contains('$')
         {
-            ids.push(id.to_string());
+            mods.push(ModMetadata::new(&id, version.as_deref()));
+        }
+    };
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            finish(current.take());
+            current = (line == "[[mods]]").then_some((None, None));
+            continue;
+        }
+        let Some((id, version)) = &mut current else {
+            continue;
+        };
+        if let Some(value) = toml_line_value(line, "modId") {
+            *id = Some(value);
+        } else if let Some(value) = toml_line_value(line, "version") {
+            *version = Some(value);
         }
     }
-    ids
+    finish(current.take());
+    mods
+}
+
+/// 读取形如 `key = "value"` 的单行字符串值。
+fn toml_line_value(line: &str, key: &str) -> Option<String> {
+    let value = line
+        .strip_prefix(key)?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim()
+        .trim_matches(['"', '\'']);
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn sync_mod_configs(
@@ -1131,6 +1272,69 @@ mod tests {
         );
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].level, crate::types::LogLevel::Skip);
+        Ok(())
+    }
+
+    fn fabric_jar(dir: &Path, id: &str, version: &str) -> Result<()> {
+        let mods = dir.join("mods");
+        fs::create_dir_all(&mods)?;
+        write_jar(
+            &mods.join(format!("{id}-{version}.jar")),
+            &[(
+                "fabric.mod.json",
+                &format!(r#"{{"id":"{id}","version":"{version}"}}"#),
+            )],
+        )
+    }
+
+    #[test]
+    fn diff_lists_version_changes_additions_and_removals() -> Result<()> {
+        let template = TempDir::new("diff-template")?;
+        let target = TempDir::new("diff-target")?;
+        for (id, version) in [("same", "1.0"), ("upgraded", "1.0"), ("dropped", "2.1")] {
+            fabric_jar(template.path(), id, version)?;
+        }
+        for (id, version) in [("same", "1.0"), ("upgraded", "1.1"), ("fresh", "0.3")] {
+            fabric_jar(target.path(), id, version)?;
+        }
+        let forge_dir = target.path().join("mods");
+        write_jar(
+            &forge_dir.join("forge.jar"),
+            &[
+                (
+                    "META-INF/mods.toml",
+                    "[[mods]]\nmodId = \"forgemod\"\nversion = \"${file.jarVersion}\"\n",
+                ),
+                (
+                    "META-INF/MANIFEST.MF",
+                    "Manifest-Version: 1.0\r\nImplementation-Version: 4.5.6\r\n",
+                ),
+            ],
+        )?;
+
+        let diff = diff_installed_mods(
+            template.path(),
+            target.path(),
+            &mut LogSink::new(&mut |_| {}),
+        )?;
+
+        let entry = |id: &str, version: &str| ModEntry {
+            id: id.to_string(),
+            version: version.to_string(),
+        };
+        assert_eq!(
+            diff.changed,
+            vec![ModVersionChange {
+                id: "upgraded".to_string(),
+                from: "1.0".to_string(),
+                to: "1.1".to_string(),
+            }]
+        );
+        assert_eq!(
+            diff.added,
+            vec![entry("forgemod", "4.5.6"), entry("fresh", "0.3")]
+        );
+        assert_eq!(diff.removed, vec![entry("dropped", "2.1")]);
         Ok(())
     }
 

@@ -498,6 +498,7 @@ mod tests {
             resource_packs: Some(PackTransfer::LinkToShared(shared.path().to_path_buf())),
             axiom_blueprints: None,
             screenshots: Some(PackTransfer::CopyMissing),
+            report_mod_changes: false,
         };
         let mut keep = |conflicts: Vec<PackConflict>| -> Result<Vec<ConflictChoice>> {
             Ok(vec![ConflictChoice::KeepExisting; conflicts.len()])
