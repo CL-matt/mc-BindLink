@@ -84,7 +84,7 @@ enum WorkerMessage {
     Finished(Result<MigrationResult>),
 }
 
-/// 使用固定配置完成迁移后展示的 Mod 变化。
+/// 每次迁移结束后展示的 Mod 变化。
 struct ModDiffDialog {
     template: String,
     target: String,
@@ -193,7 +193,7 @@ const PRESETS: &[Preset] = &[
         cache_choice: CacheChoice::Copy,
     },
     Preset {
-        name: "neko喵喵喵",
+        name: "nekovc",
         mode: SyncMode::FullOverwrite,
         cache_choice: CacheChoice::LinkToShared,
     },
@@ -249,8 +249,6 @@ struct MigratorApp {
     /// 尚未回退的迁移记录，最新的在前。
     history: Vec<HistoryEntry>,
     confirm_rollback: bool,
-    /// 点击过固定配置按钮后为 `true`，此后的迁移结束时对比并展示 Mod 变化。
-    preset_applied: bool,
     /// 正在进行的迁移的模板与目标实例名，用于 Mod 变化窗口的标题。
     running_pair: Option<(String, String)>,
     mod_diff_dialog: Option<ModDiffDialog>,
@@ -286,7 +284,6 @@ impl MigratorApp {
             history_root: None,
             history: Vec::new(),
             confirm_rollback: false,
-            preset_applied: false,
             running_pair: None,
             mod_diff_dialog: None,
             worker: None,
@@ -453,7 +450,7 @@ impl MigratorApp {
             resource_packs,
             axiom_blueprints,
             screenshots,
-            report_mod_changes: self.preset_applied,
+            report_mod_changes: true,
         })
     }
 
@@ -599,7 +596,6 @@ impl MigratorApp {
         self.voxy_choice = preset.cache_choice;
         self.bobby_choice = preset.cache_choice;
         self.blueprint_choice = PackChoice::Skip;
-        self.preset_applied = true;
         self.screenshot_choice = PackChoice::LinkToShared;
         self.push_log(LogLevel::Info, format!("已应用固定配置：{}", preset.name));
     }
