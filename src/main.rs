@@ -4,6 +4,7 @@ mod engine;
 mod fs_ops;
 mod journal;
 mod launcher;
+mod log_file;
 mod map_sync;
 mod pack_sync;
 #[cfg(test)]
@@ -232,6 +233,8 @@ struct MigratorApp {
     /// 用户手动选择的共享目录，为 `None` 时使用目标实例的默认共享目录。
     shared_dir: Option<PathBuf>,
     logs: Vec<LogEntry>,
+    /// 创建或写入失败时为 `None`，此后日志只显示在界面上。
+    log_file: Option<log_file::LogFile>,
     status: RunStatus,
     task: Task,
     /// 找不到 APPDATA 时为 `None`，此时无法记录迁移，也无法迁移。
@@ -265,6 +268,7 @@ impl MigratorApp {
             screenshot_choice: PackChoice::LinkToShared,
             shared_dir: None,
             logs: Vec::new(),
+            log_file: None,
             status: RunStatus::Idle,
             task: Task::Migration,
             history_root: None,
@@ -276,6 +280,13 @@ impl MigratorApp {
             app_logo: None,
         };
         apply_style(ctx);
+        match log_file::logs_dir().and_then(|dir| log_file::LogFile::create(&dir)) {
+            Ok(file) => app.log_file = Some(file),
+            Err(err) => app.push_log(
+                LogLevel::Warning,
+                format!("无法创建日志文件，日志只显示在界面上：{err:#}"),
+            ),
+        }
         if let Some(message) = icon_error {
             app.push_log(LogLevel::Warning, message);
         }
@@ -321,10 +332,26 @@ impl MigratorApp {
     }
 
     fn push_log(&mut self, level: LogLevel, message: impl Into<String>) {
-        self.logs.push(LogEntry {
+        self.add_logs([LogEntry {
             level,
             message: message.into(),
-        });
+        }]);
+    }
+
+    /// 所有日志都经由这里进入界面，并同时追加到日志文件。
+    fn add_logs(&mut self, entries: impl IntoIterator<Item = LogEntry>) {
+        for entry in entries {
+            if let Some(file) = &mut self.log_file
+                && let Err(err) = file.append(&entry)
+            {
+                self.log_file = None;
+                self.logs.push(LogEntry {
+                    level: LogLevel::Warning,
+                    message: format!("写入日志文件失败，之后的日志只显示在界面上：{err:#}"),
+                });
+            }
+            self.logs.push(entry);
+        }
     }
 
     fn rescan_instances(&mut self) {
@@ -333,7 +360,7 @@ impl MigratorApp {
             &self.selected_dirs,
             &mut LogSink::new(&mut |entry| entries.push(entry)),
         );
-        self.logs.extend(entries);
+        self.add_logs(entries);
 
         let template = self.selected_instance(self.template_index).cloned();
         let target = self.selected_instance(self.target_index).cloned();
@@ -510,7 +537,7 @@ impl MigratorApp {
                 }
             }
         }
-        self.logs.extend(received);
+        self.add_logs(received);
         let Some(outcome) = finished else {
             return;
         };
@@ -772,6 +799,12 @@ impl MigratorApp {
                 {
                     self.logs.clear();
                     self.status = RunStatus::Idle;
+                }
+                if ui.button("📂 打开日志文件夹").clicked()
+                    && let Err(err) =
+                        log_file::logs_dir().and_then(|dir| log_file::open_in_explorer(&dir))
+                {
+                    self.push_log(LogLevel::Warning, format!("打开日志文件夹失败：{err:#}"));
                 }
             });
         });

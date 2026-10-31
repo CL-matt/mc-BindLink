@@ -124,7 +124,7 @@ cargo build --release
 
 ## 问题反馈
 
-使用中遇到问题或有功能建议，请在 [Issues](https://github.com/CL-matt/mc-bindsync/issues) 中提交，并附上日志区的相关内容。
+使用中遇到问题或有功能建议，请在 [Issues](https://github.com/CL-matt/mc-bindsync/issues) 中提交，并附上日志。日志区右上角的"打开日志文件夹"会打开 `%APPDATA%\BindLink\logs`，每次运行对应一个日志文件，最多保留最近 20 次。
 
 ## 相关项目
 
