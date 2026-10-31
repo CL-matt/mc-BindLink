@@ -366,6 +366,28 @@ impl MigratorApp {
         }
     }
 
+    /// 按当前实例与共享目录更新日志文件的脱敏规则。
+    fn refresh_log_redactions(&mut self) {
+        let Some(file) = &mut self.log_file else {
+            return;
+        };
+        let mut roots: Vec<PathBuf> = Vec::new();
+        let mut servers = Vec::new();
+        for instance in &self.instances {
+            if !roots.contains(&instance.minecraft_root) {
+                roots.push(instance.minecraft_root.clone());
+            }
+            servers.extend(map_sync::list_server_names(&instance.game_dir));
+        }
+        let user_profile = env::var_os("USERPROFILE").map(PathBuf::from);
+        file.set_redactor(log_file::Redactor::new(
+            user_profile.as_deref(),
+            &roots,
+            self.shared_dir.as_deref(),
+            &servers,
+        ));
+    }
+
     fn rescan_instances(&mut self) {
         let mut entries = Vec::new();
         let instances = launcher::scan_all_instances(
@@ -373,6 +395,7 @@ impl MigratorApp {
             &mut LogSink::new(&mut |entry| entries.push(entry)),
         );
         self.add_logs(entries);
+        self.refresh_log_redactions();
 
         let template = self.selected_instance(self.template_index).cloned();
         let target = self.selected_instance(self.target_index).cloned();
@@ -467,6 +490,7 @@ impl MigratorApp {
             return;
         };
         self.running_pair = Some((request.template.name.clone(), request.target.name.clone()));
+        self.refresh_log_redactions();
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         // 复制 Voxy 或 Bobby 缓存可能耗时数分钟，放到后台线程以免阻塞界面

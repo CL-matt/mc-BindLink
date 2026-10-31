@@ -116,6 +116,44 @@ fn modified_time(path: &Path) -> Result<SystemTime> {
 }
 
 /// 缓存在游戏目录中的相对位置，其下每个子目录对应一个世界或服务器地址。
+/// 列出实例中出现的多人服务器地址，供日志脱敏使用。
+///
+/// 来源为 Xaero 的 `Multiplayer_<地址>` 目录，以及 Voxy、Bobby 缓存的服务器目录；
+/// 只保留含 `.` 或 `:` 的名称，避免把单人世界名或纯数字当作地址替换。
+pub fn list_server_names(game_dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut collect = |dir: PathBuf, strip_prefix: Option<&str>| {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".bak") || name.ends_with(".rollback") {
+                continue;
+            }
+            let server = match strip_prefix {
+                Some(prefix) => match name.strip_prefix(prefix) {
+                    Some(server) => server.to_string(),
+                    None => continue,
+                },
+                None => name,
+            };
+            if server.len() >= 4 && (server.contains('.') || server.contains(':')) {
+                names.push(server);
+            }
+        }
+    };
+    for root in MAP_ROOTS {
+        collect(game_dir.join(root), Some("Multiplayer_"));
+    }
+    for kind in [ServerCache::Voxy, ServerCache::Bobby] {
+        collect(game_dir.join(cache_root(kind)), None);
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn cache_root(kind: ServerCache) -> &'static str {
     match kind {
         ServerCache::Voxy => ".voxy/saves",
@@ -293,6 +331,29 @@ mod tests {
 
     fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
         File::options().write(true).open(path)?.set_modified(time)?;
+        Ok(())
+    }
+
+    #[test]
+    fn lists_server_names_from_maps_and_caches() -> Result<()> {
+        let game = TempDir::new("servers")?;
+        for dir in [
+            "xaero/minimap/Multiplayer_mc.example.com",
+            "xaero/world-map/新的世界",
+            ".voxy/saves/play.example.net",
+            ".voxy/saves/single world",
+            ".bobby/10.0.0.1_25565",
+            ".bobby/old.example.org.1793.bak",
+        ] {
+            fs::create_dir_all(game.path().join(dir))?;
+        }
+
+        let names = list_server_names(game.path());
+
+        assert_eq!(
+            names,
+            vec!["10.0.0.1_25565", "mc.example.com", "play.example.net"]
+        );
         Ok(())
     }
 

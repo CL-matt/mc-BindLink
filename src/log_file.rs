@@ -1,4 +1,7 @@
 //! 把界面日志同时写入 `%APPDATA%\BindLink\logs` 下的文本文件，便于关闭程序后查看或附在问题反馈中。
+//!
+//! 日志文件可能被公开附在问题反馈中，写入前用 [`Redactor`] 把用户目录、游戏目录与服务器地址
+//! 替换为占位符；界面中的日志保持原样，方便本人排查。
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -28,6 +31,66 @@ pub fn logs_dir() -> Result<PathBuf> {
 pub struct LogFile {
     file: File,
     path: PathBuf,
+    redactor: Redactor,
+}
+
+/// 写入日志文件前替换敏感文本的规则，按原文长度从长到短依次替换，避免短规则截断长路径。
+#[derive(Debug, Default)]
+pub struct Redactor {
+    rules: Vec<(String, String)>,
+}
+
+impl Redactor {
+    /// `game_roots` 依次替换为 `<游戏目录1>`、`<游戏目录2>`……，服务器地址替换为 [`server_alias`]。
+    pub fn new(
+        user_profile: Option<&Path>,
+        game_roots: &[PathBuf],
+        shared_dir: Option<&Path>,
+        servers: &[String],
+    ) -> Self {
+        let mut rules = Vec::new();
+        for (index, root) in game_roots.iter().enumerate() {
+            rules.push((
+                root.display().to_string(),
+                format!("<游戏目录{}>", index + 1),
+            ));
+        }
+        if let Some(dir) = shared_dir {
+            rules.push((dir.display().to_string(), "<共享目录>".to_string()));
+        }
+        if let Some(profile) = user_profile {
+            rules.push((profile.display().to_string(), "%USERPROFILE%".to_string()));
+        }
+        for server in servers {
+            rules.push((server.clone(), server_alias(server)));
+        }
+        rules.retain(|(original, _)| !original.is_empty());
+        // 同长度按原文排序，使重复规则相邻以便去重
+        rules.sort_by_key(|(original, _)| (std::cmp::Reverse(original.len()), original.clone()));
+        rules.dedup_by(|a, b| a.0 == b.0);
+        Self { rules }
+    }
+
+    pub fn apply(&self, text: &str) -> String {
+        self.rules
+            .iter()
+            .fold(text.to_string(), |text, (original, alias)| {
+                text.replace(original, alias)
+            })
+    }
+}
+
+/// 服务器地址的不可还原代号：同一地址在任何日志中都得到相同代号，便于对照排查。
+///
+/// 使用 64 位 FNV-1a 哈希，算法固定，不随 Rust 版本变化。
+pub fn server_alias(server: &str) -> String {
+    let hash = server
+        .to_lowercase()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    format!("服务器-{:08x}", hash >> 32)
 }
 
 impl LogFile {
@@ -45,7 +108,15 @@ impl LogFile {
             .open(&path)
             .with_context(|| format!("创建日志文件 {} 失败", path.display()))?;
         prune_old_logs(dir)?;
-        Ok(Self { file, path })
+        Ok(Self {
+            file,
+            path,
+            redactor: Redactor::default(),
+        })
+    }
+
+    pub fn set_redactor(&mut self, redactor: Redactor) {
+        self.redactor = redactor;
     }
 
     pub fn append(&mut self, entry: &LogEntry) -> Result<()> {
@@ -53,7 +124,7 @@ impl LogFile {
             "{} {} {}\r\n",
             format_utc(SystemTime::now()),
             level_tag(entry.level),
-            entry.message
+            self.redactor.apply(&entry.message)
         );
         self.file
             .write_all(line.as_bytes())
@@ -153,6 +224,28 @@ mod tests {
         assert_eq!(format_utc(at(0)), "1970-01-01 00:00:00 UTC");
         assert_eq!(format_utc(at(951_782_400)), "2000-02-29 00:00:00 UTC");
         assert_eq!(format_utc(at(1_793_405_330)), "2026-10-31 00:08:50 UTC");
+    }
+
+    #[test]
+    fn redactor_hides_paths_and_servers() {
+        let redactor = Redactor::new(
+            Some(Path::new(r"C:\Users\someone")),
+            &[PathBuf::from(r"C:\Users\someone\Games\.minecraft")],
+            Some(Path::new(r"D:\shared")),
+            &["mc.example.com".to_string()],
+        );
+        let text = redactor.apply(
+            r"复制 C:\Users\someone\Games\.minecraft\versions\a\xaero\minimap\Multiplayer_mc.example.com 到 D:\shared\voxy\mc.example.com，日志在 C:\Users\someone\AppData",
+        );
+        let alias = server_alias("mc.example.com");
+        assert_eq!(
+            text,
+            format!(
+                r"复制 <游戏目录1>\versions\a\xaero\minimap\Multiplayer_{alias} 到 <共享目录>\voxy\{alias}，日志在 %USERPROFILE%\AppData"
+            )
+        );
+        assert_eq!(alias, server_alias("MC.Example.com"));
+        assert_ne!(alias, server_alias("other.example.com"));
     }
 
     #[test]

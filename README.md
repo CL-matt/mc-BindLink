@@ -124,7 +124,7 @@ cargo build --release
 
 ## 问题反馈
 
-使用中遇到问题或有功能建议，请在 [Issues](https://github.com/CL-matt/mc-bindsync/issues) 中提交，并附上日志。日志区右上角的"打开日志文件夹"会打开 `%APPDATA%\BindLink\logs`，每次运行对应一个日志文件，最多保留最近 20 次。
+使用中遇到问题或有功能建议，请在 [Issues](https://github.com/CL-matt/mc-bindsync/issues) 中提交，并附上日志。日志区右上角的"打开日志文件夹"会打开 `%APPDATA%\BindLink\logs`，每次运行对应一个日志文件，最多保留最近 20 次。日志文件中的用户目录、游戏目录与服务器地址已替换为 `%USERPROFILE%`、`<游戏目录1>`、`服务器-xxxxxxxx` 等代号，可以直接附上；界面日志区显示的是未替换的原始内容，复制界面内容前请自行检查。
 
 ## 相关项目
 

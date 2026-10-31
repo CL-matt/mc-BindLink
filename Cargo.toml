@@ -1,6 +1,6 @@
 [package]
 name = "mc-bindsync"
-version = "1.0.0+0107"
+version = "1.0.0+0108"
 edition = "2024"
 
 [[bin]]
