@@ -176,9 +176,10 @@
 - `src/test_support.rs` 仅在测试编译时引入，提供测试用临时目录。
 
 ### 开发环境
-- 工具链：rustup `stable-x86_64-pc-windows-gnu`，安装在 `<工具链目录>`（`RUSTUP_HOME`、`CARGO_HOME` 为用户级环境变量）。
-- `windows` 系列依赖以 raw-dylib 方式链接，需要完整 MinGW-w64 提供的 `dlltool` 与 `as`：使用 WinLibs（GCC 16.2.0，UCRT），位于 `<工具链目录>\mingw64`，其 `bin` 已加入用户 PATH。
-- 构建产物目录由 `.cargo/config.toml` 指向 `<构建目录>`，避开 网盘 同步。
+- 工具链：rustup `stable-x86_64-pc-windows-gnu`，安装在开发机自选的独立目录（通过用户级环境变量 `RUSTUP_HOME`、`CARGO_HOME` 指定）。
+- `windows` 系列依赖以 raw-dylib 方式链接，需要完整 MinGW-w64 提供的 `dlltool` 与 `as`：使用 WinLibs（GCC 16.2.0，UCRT），与工具链放在同一目录下，其 `bin` 已加入用户 PATH。
+- 项目位于网盘同步目录时，构建产物目录在本地 `.cargo/config.toml` 中指向同步范围之外；该文件含开发机路径，已加入 `.gitignore`。
+- 文档、注释与提交信息中禁止写入开发机的真实目录、用户名或个人服务器地址，统一使用 `<游戏目录>`、`example.com` 等占位描述。
 
 ---
 

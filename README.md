@@ -103,7 +103,7 @@ BindLink（键链）是一个 Windows 桌面工具，把一个 Minecraft 实例�
 cargo build --release
 ```
 
-`.cargo/config.toml` 把构建产物目录设在 `<构建目录>`，其他机器上构建前请修改或删除该配置。构建产物为 `target/release/bindlink.exe`。运行 `cargo test` 执行单元测试。
+项目放在网盘同步目录时，可以在本地新建 `.cargo/config.toml` 并设置 `[build] target-dir` 把构建产物放到同步范围之外；该文件已加入 `.gitignore`，不随仓库分发。构建产物为 `target/release/bindlink.exe`。运行 `cargo test` 执行单元测试。
 
 ## 项目结构
 

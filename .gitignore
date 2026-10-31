@@ -28,3 +28,6 @@ exemp/
 
 # LorianTool 图标需要授权，仅保留在本地，不随仓库分发
 logos/logo-square-LorianTool.png
+
+# 本地 Cargo 配置含开发机路径（构建产物目录），不随仓库分发
+.cargo/config.toml
