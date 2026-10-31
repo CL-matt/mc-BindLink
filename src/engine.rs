@@ -606,10 +606,25 @@ pub fn detect_installed_mod_ids(mods_dir: &Path, log: &mut LogSink) -> Result<Ha
             continue;
         }
         match read_mod_ids_from_jar(&path) {
-            Ok(found) if found.is_empty() => {
+            Ok(metadata) if metadata.ids.is_empty() && metadata.problems.is_empty() => {
                 log.skip(format!("未在 {} 中找到 Mod 元数据", path.display()));
             }
-            Ok(found) => ids.extend(found),
+            Ok(metadata) if metadata.ids.is_empty() => log.warn(format!(
+                "跳过无法解析的 Mod 文件 {}：{}",
+                path.display(),
+                metadata.problems.join("；")
+            )),
+            Ok(metadata) => {
+                if !metadata.problems.is_empty() {
+                    log.skip(format!(
+                        "{}：已识别 {}，忽略无法解析的元数据（{}）",
+                        path.display(),
+                        metadata.ids.join("、"),
+                        metadata.problems.join("；")
+                    ));
+                }
+                ids.extend(metadata.ids);
+            }
             Err(err) => log.warn(format!(
                 "跳过无法解析的 Mod 文件 {}：{err:#}",
                 path.display()
@@ -619,29 +634,93 @@ pub fn detect_installed_mod_ids(mods_dir: &Path, log: &mut LogSink) -> Result<Ha
     Ok(ids)
 }
 
-fn read_mod_ids_from_jar(path: &Path) -> Result<Vec<String>> {
+/// 单个 jar 的元数据读取结果。
+#[derive(Debug, Default)]
+struct JarMetadata {
+    ids: Vec<String>,
+    /// 无法读取或解析的元数据文件及原因。
+    problems: Vec<String>,
+}
+
+type MetadataParser = fn(&str) -> Result<Vec<String>>;
+
+/// 各加载器的元数据文件及其解析函数。
+const METADATA_PARSERS: &[(&str, MetadataParser)] = &[
+    ("fabric.mod.json", parse_fabric_mod_ids),
+    ("quilt.mod.json", parse_quilt_mod_ids),
+    ("META-INF/mods.toml", parse_forge_mod_ids),
+    ("META-INF/neoforge.mods.toml", parse_forge_mod_ids),
+];
+
+/// 逐个解析 jar 中的元数据文件；一份损坏只记为问题，不影响从其他元数据读到的 ID。
+///
+/// 同一个 jar 常同时带有多个加载器的元数据，作者只维护实际使用的那份，其余可能残留未替换的占位符。
+fn read_mod_ids_from_jar(path: &Path) -> Result<JarMetadata> {
     let file = File::open(path).context("打开文件失败")?;
     let mut archive = ZipArchive::new(file).context("不是有效的 jar 压缩包")?;
-    let mut ids = Vec::new();
-
-    if let Some(text) = read_zip_text(&mut archive, "fabric.mod.json")? {
-        let json = parse_json_text(&text).context("fabric.mod.json 格式错误")?;
-        ids.extend(json.get("id").and_then(Value::as_str).map(str::to_string));
-    }
-    if let Some(text) = read_zip_text(&mut archive, "quilt.mod.json")? {
-        let json = parse_json_text(&text).context("quilt.mod.json 格式错误")?;
-        ids.extend(
-            json.pointer("/quilt_loader/id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        );
-    }
-    for name in ["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
-        if let Some(text) = read_zip_text(&mut archive, name)? {
-            ids.extend(parse_forge_mod_ids(&text).with_context(|| format!("{name} 格式错误"))?);
+    let mut metadata = JarMetadata::default();
+    for (name, parse) in METADATA_PARSERS {
+        let parsed = read_zip_text(&mut archive, name)
+            .and_then(|text| text.map(|text| parse(&text)).transpose());
+        match parsed {
+            Ok(Some(ids)) => metadata.ids.extend(ids),
+            Ok(None) => {}
+            Err(err) => metadata.problems.push(format!("{name} 格式错误：{err:#}")),
         }
     }
-    Ok(ids)
+    metadata.ids.dedup();
+    Ok(metadata)
+}
+
+fn parse_fabric_mod_ids(text: &str) -> Result<Vec<String>> {
+    let json = parse_mod_metadata_json(text)?;
+    Ok(json
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .into_iter()
+        .collect())
+}
+
+fn parse_quilt_mod_ids(text: &str) -> Result<Vec<String>> {
+    let json = parse_mod_metadata_json(text)?;
+    Ok(json
+        .pointer("/quilt_loader/id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .into_iter()
+        .collect())
+}
+
+/// Fabric 加载器能读取字符串中直接换行的元数据，严格的 JSON 解析会拒绝；
+/// 先把字符串内的控制字符转义，再按标准 JSON 解析。
+fn parse_mod_metadata_json(text: &str) -> Result<Value> {
+    parse_json_text(&escape_control_chars_in_strings(text))
+}
+
+fn escape_control_chars_in_strings(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    let (mut in_string, mut after_backslash) = (false, false);
+    for ch in text.chars() {
+        if in_string && !after_backslash && ch < ' ' {
+            match ch {
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                other => escaped.push_str(&format!("\\u{:04x}", u32::from(other))),
+            }
+            continue;
+        }
+        escaped.push(ch);
+        if in_string && after_backslash {
+            after_backslash = false;
+        } else if in_string && ch == '\\' {
+            after_backslash = true;
+        } else if ch == '"' {
+            in_string = !in_string;
+        }
+    }
+    escaped
 }
 
 fn read_zip_text<R: Read + Seek>(
@@ -664,8 +743,18 @@ fn parse_json_text(text: &str) -> Result<Value> {
     Ok(serde_json::from_str(text.trim_start_matches('\u{feff}'))?)
 }
 
+/// 解析 `mods.toml`；整份文件因残留占位符等原因无法解析时，退回逐行查找 `[[mods]]` 下的 `modId`。
 fn parse_forge_mod_ids(text: &str) -> Result<Vec<String>> {
-    let document: DocumentMut = text.parse()?;
+    let document: DocumentMut = match text.parse() {
+        Ok(document) => document,
+        Err(err) => {
+            let ids = scan_forge_mod_ids(text);
+            if ids.is_empty() {
+                return Err(err.into());
+            }
+            return Ok(ids);
+        }
+    };
     let Some(mods) = document
         .get("mods")
         .and_then(|item| item.as_array_of_tables())
@@ -679,6 +768,30 @@ fn parse_forge_mod_ids(text: &str) -> Result<Vec<String>> {
         .filter(|id| !id.contains('$'))
         .map(str::to_string)
         .collect())
+}
+
+fn scan_forge_mod_ids(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut in_mods_table = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_mods_table = line == "[[mods]]";
+            continue;
+        }
+        let value = line
+            .strip_prefix("modId")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(|value| value.trim().trim_matches(['"', '\'']));
+        if in_mods_table
+            && let Some(id) = value
+            && !id.is_empty()
+            && !id.contains('$')
+        {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 fn sync_mod_configs(
@@ -975,6 +1088,49 @@ mod tests {
             HashSet::from(["axiom".to_string(), "create".to_string()])
         );
         assert_eq!(messages.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn tolerates_lenient_metadata_and_keeps_ids_from_valid_files() -> Result<()> {
+        let dir = TempDir::new("mods-lenient")?;
+        write_jar(
+            &dir.path().join("multiline.jar"),
+            &[(
+                "fabric.mod.json",
+                "{\"id\": \"emf\", \"description\": \"first line\n\tsecond line\"}",
+            )],
+        )?;
+        write_jar(
+            &dir.path().join("universal.jar"),
+            &[
+                ("fabric.mod.json", r#"{"id":"mixintrace"}"#),
+                (
+                    "META-INF/mods.toml",
+                    "[[mods]]\nmodId = \"${mod_id}\"\n[[dependencies.${mod_id}]]\nmodId = \"forge\"\n",
+                ),
+            ],
+        )?;
+        write_jar(
+            &dir.path().join("forge-placeholder.jar"),
+            &[(
+                "META-INF/mods.toml",
+                "[[mods]]\nmodId = \"realmod\"\n[[dependencies.${mod_id}]]\nmodId = \"forge\"\n",
+            )],
+        )?;
+
+        let mut messages = Vec::new();
+        let ids = detect_installed_mod_ids(
+            dir.path(),
+            &mut LogSink::new(&mut |entry| messages.push(entry)),
+        )?;
+
+        assert_eq!(
+            ids,
+            HashSet::from(["emf", "mixintrace", "realmod"].map(String::from))
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].level, crate::types::LogLevel::Skip);
         Ok(())
     }
 
