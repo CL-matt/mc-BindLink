@@ -163,9 +163,10 @@ pub fn run_migration(
     }
 
     log.info(format!(
-        "迁移结束：修改 {} 处，警告 {} 条",
+        "迁移结束：修改 {} 处，警告 {} 条，失败 {} 个步骤",
         result.changed_paths.len(),
-        result.warnings.len()
+        result.warnings.len(),
+        result.failures.len()
     ));
     if request.report_mod_changes {
         match diff_installed_mods(template_dir, target_dir, log) {
@@ -244,13 +245,14 @@ fn record_step_failure(
     if let Err(err) = outcome {
         let message = format!("{step}失败：{err:#}");
         log.error(message.clone());
-        result.warnings.push(message);
+        result.failures.push(message);
     }
 }
 
 fn merge_result(result: &mut MigrationResult, step: MigrationResult) {
     result.changed_paths.extend(step.changed_paths);
     result.warnings.extend(step.warnings);
+    result.failures.extend(step.failures);
 }
 
 /// 写入前备份 `path`，返回本次使用的备份路径；`path` 不存在时返回 `None`。

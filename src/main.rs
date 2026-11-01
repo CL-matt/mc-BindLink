@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod elevation;
 mod engine;
 mod fs_ops;
 mod journal;
@@ -70,10 +71,17 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
+    let startup = elevation::StartupArgs::parse(env::args_os().skip(1));
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|cc| Ok(Box::new(MigratorApp::new(&cc.egui_ctx, icon_error)))),
+        Box::new(|cc| {
+            Ok(Box::new(MigratorApp::new(
+                &cc.egui_ctx,
+                icon_error,
+                startup,
+            )))
+        }),
     )
 }
 
@@ -203,8 +211,19 @@ const PRESETS: &[Preset] = &[
 enum RunStatus {
     Idle,
     Running,
-    Finished { warnings: usize },
+    Finished {
+        warnings: usize,
+    },
+    /// 任务执行完毕，但有步骤失败。
+    Incomplete {
+        failures: usize,
+    },
     Failed,
+}
+
+/// 需要写入的目录没有权限时的提示。
+struct PermissionDialog {
+    dirs: Vec<PathBuf>,
 }
 
 /// 后台线程正在或最近执行的任务，决定状态栏与日志中的措辞。
@@ -252,6 +271,9 @@ struct MigratorApp {
     /// 正在进行的迁移的模板与目标实例名，用于 Mod 变化窗口的标题。
     running_pair: Option<(String, String)>,
     mod_diff_dialog: Option<ModDiffDialog>,
+    permission_dialog: Option<PermissionDialog>,
+    /// 最近一次检查写入权限时的模板与目标选择，选择未变时不重复提示。
+    checked_selection: (Option<usize>, Option<usize>),
     worker: Option<Receiver<WorkerMessage>>,
     conflict_dialog: Option<ConflictDialog>,
     /// 未编译进图标或解码失败时为 `None`，标题栏改为只显示文字链接。
@@ -261,7 +283,11 @@ struct MigratorApp {
 }
 
 impl MigratorApp {
-    fn new(ctx: &egui::Context, icon_error: Option<String>) -> Self {
+    fn new(
+        ctx: &egui::Context,
+        icon_error: Option<String>,
+        startup: elevation::StartupArgs,
+    ) -> Self {
         let mut app = Self {
             selected_dirs: Vec::new(),
             instances: Vec::new(),
@@ -286,6 +312,8 @@ impl MigratorApp {
             confirm_rollback: false,
             running_pair: None,
             mod_diff_dialog: None,
+            permission_dialog: None,
+            checked_selection: (None, None),
             worker: None,
             conflict_dialog: None,
             lorian_logo: None,
@@ -329,8 +357,110 @@ impl MigratorApp {
             ),
         }
         app.refresh_history();
+        app.selected_dirs = startup.dirs;
         app.rescan_instances();
+        let find = |dir: &Option<PathBuf>, instances: &[DetectedInstance]| {
+            dir.as_ref()
+                .and_then(|dir| instances.iter().position(|i| &i.game_dir == dir))
+        };
+        app.template_index = find(&startup.template, &app.instances);
+        app.target_index = find(&startup.target, &app.instances);
+        // 由提权重启恢复的选择已在重启前提示过，不再重复弹窗
+        app.checked_selection = (app.template_index, app.target_index);
         app
+    }
+
+    /// 本次迁移需要写入的目录：目标实例、用到的共享目录，以及共享模式下会被移动内容的模板实例。
+    fn required_write_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(target) = self.selected_instance(self.target_index) {
+            dirs.push(target.game_dir.clone());
+        }
+        if self.needs_shared_dir() {
+            dirs.extend(self.effective_shared_dir());
+            if let Some(template) = self.selected_instance(self.template_index) {
+                dirs.push(template.game_dir.clone());
+            }
+        }
+        dirs
+    }
+
+    /// 检查需要写入的目录，有不可写的目录时弹出提权提示；返回是否全部可写。
+    fn check_write_access(&mut self) -> bool {
+        match elevation::find_unwritable(&self.required_write_dirs()) {
+            Ok(dirs) if dirs.is_empty() => true,
+            Ok(dirs) => {
+                for dir in &dirs {
+                    self.push_log(
+                        LogLevel::Warning,
+                        format!("没有写入权限：{}", dir.display()),
+                    );
+                }
+                self.permission_dialog = Some(PermissionDialog { dirs });
+                false
+            }
+            Err(err) => {
+                self.push_log(LogLevel::Warning, format!("检查写入权限失败：{err:#}"));
+                true
+            }
+        }
+    }
+
+    fn restart_as_admin(&mut self, ctx: &egui::Context) {
+        let startup = elevation::StartupArgs {
+            dirs: self.selected_dirs.clone(),
+            template: self
+                .selected_instance(self.template_index)
+                .map(|i| i.game_dir.clone()),
+            target: self
+                .selected_instance(self.target_index)
+                .map(|i| i.game_dir.clone()),
+        };
+        match elevation::restart_as_admin(&startup) {
+            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(err) => self.push_log(LogLevel::Warning, format!("{err:#}")),
+        }
+    }
+
+    fn show_permission_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &self.permission_dialog else {
+            return;
+        };
+        let mut decision = None;
+        egui::Modal::new(egui::Id::unique("permission")).show(ctx, |ui| {
+            ui.set_max_width(520.0);
+            ui.label(RichText::new("需要管理员权限").size(18.0).strong());
+            ui.label("以下目录当前没有写入权限，迁移会失败：");
+            for dir in &dialog.dirs {
+                ui.label(RichText::new(dir.display().to_string()).monospace());
+            }
+            ui.label(
+                RichText::new("这些目录通常位于 Program Files 等受保护位置。以管理员身份重新启动后会恢复当前选择的实例；也可以把启动器移到普通目录，以后就不再需要管理员权限。")
+                    .weak(),
+            );
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("取消").clicked() {
+                    decision = Some(false);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let restart =
+                        egui::Button::new(RichText::new("以管理员身份重新启动").color(Color32::WHITE))
+                            .fill(ACCENT);
+                    if ui.add(restart).clicked() {
+                        decision = Some(true);
+                    }
+                });
+            });
+        });
+        match decision {
+            Some(true) => {
+                self.permission_dialog = None;
+                self.restart_as_admin(ctx);
+            }
+            Some(false) => self.permission_dialog = None,
+            None => {}
+        }
     }
 
     fn refresh_history(&mut self) {
@@ -489,6 +619,10 @@ impl MigratorApp {
             self.push_log(LogLevel::Error, "无法记录迁移，已取消");
             return;
         };
+        if !self.check_write_access() {
+            self.push_log(LogLevel::Error, "部分目录没有写入权限，已取消迁移");
+            return;
+        }
         self.running_pair = Some((request.template.name.clone(), request.target.name.clone()));
         self.refresh_log_redactions();
         let (sender, receiver) = mpsc::channel();
@@ -593,6 +727,14 @@ impl MigratorApp {
             });
         }
         match outcome {
+            Ok(result) if !result.failures.is_empty() => {
+                let failures = result.failures.len();
+                self.push_log(
+                    LogLevel::Error,
+                    format!("{task}未完成：{failures} 个步骤失败，请查看上方日志"),
+                );
+                self.status = RunStatus::Incomplete { failures };
+            }
             Ok(result) if result.warnings.is_empty() => {
                 self.push_log(LogLevel::Success, format!("{task}完成"));
                 self.status = RunStatus::Finished { warnings: 0 };
@@ -684,6 +826,11 @@ impl MigratorApp {
             field_label(ui, "目标实例（写入到这里）");
             show_instance_combo(ui, "target_combo", &self.instances, &mut self.target_index);
         });
+        let selection = (self.template_index, self.target_index);
+        if selection != self.checked_selection && self.target_index.is_some() {
+            self.checked_selection = selection;
+            self.check_write_access();
+        }
 
         section(ui, "固定配置", |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -787,6 +934,15 @@ impl MigratorApp {
                     ui.label(
                         RichText::new(format!("⚠ {}完成，{warnings} 条警告", self.task.label()))
                             .color(log_color(ui, LogLevel::Warning)),
+                    );
+                }
+                RunStatus::Incomplete { failures } => {
+                    ui.label(
+                        RichText::new(format!(
+                            "✖ {}未完成，{failures} 个步骤失败",
+                            self.task.label()
+                        ))
+                        .color(log_color(ui, LogLevel::Error)),
                     );
                 }
                 RunStatus::Failed => {
@@ -1107,6 +1263,7 @@ impl eframe::App for MigratorApp {
         self.show_conflict_dialog(&ctx);
         self.show_rollback_confirm(&ctx);
         self.show_mod_diff_dialog(&ctx);
+        self.show_permission_dialog(&ctx);
     }
 }
 

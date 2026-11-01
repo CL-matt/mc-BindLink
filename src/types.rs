@@ -252,6 +252,8 @@ pub struct MigrationResult {
     pub changed_paths: Vec<PathBuf>,
     /// 被跳过但不影响其他步骤的问题。
     pub warnings: Vec<String>,
+    /// 整个步骤失败的原因，例如没有写入权限。
+    pub failures: Vec<String>,
     /// 请求了 Mod 对比且对比成功时才有值。
     pub mod_diff: Option<ModDiff>,
 }
