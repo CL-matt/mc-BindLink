@@ -87,7 +87,7 @@ fn main() -> eframe::Result {
 
 enum WorkerMessage {
     Log(LogEntry),
-    /// 后台线程遇到材质包或蓝图同名冲突，阻塞等待界面通过附带的发送端回传用户选择。
+    /// 后台线程遇到资源同名冲突，阻塞等待界面通过附带的发送端回传用户选择。
     Conflicts(Vec<PackConflict>, Sender<Vec<ConflictChoice>>),
     Finished(Result<MigrationResult>),
 }
@@ -128,6 +128,12 @@ impl PackChoice {
             }
             (PackChoice::LinkToShared, SharedAsset::ResourcePacks) => {
                 "Junction 指向共享目录（同步启用列表）"
+            }
+            (PackChoice::CopyMissing, SharedAsset::ShaderPacks) => {
+                "复制缺少的光影包（同步当前光影）"
+            }
+            (PackChoice::LinkToShared, SharedAsset::ShaderPacks) => {
+                "Junction 指向共享目录（同步当前光影）"
             }
             (PackChoice::CopyMissing, SharedAsset::Screenshots) => "复制缺少的截图",
             (PackChoice::LinkToShared, SharedAsset::Screenshots) => {
@@ -254,6 +260,7 @@ struct MigratorApp {
     voxy_choice: CacheChoice,
     bobby_choice: CacheChoice,
     pack_choice: PackChoice,
+    shader_choice: PackChoice,
     blueprint_choice: PackChoice,
     screenshot_choice: PackChoice,
     /// 用户手动选择的共享目录，为 `None` 时使用目标实例的默认共享目录。
@@ -300,6 +307,7 @@ impl MigratorApp {
             voxy_choice: CacheChoice::Skip,
             bobby_choice: CacheChoice::Skip,
             pack_choice: PackChoice::Skip,
+            shader_choice: PackChoice::Skip,
             blueprint_choice: PackChoice::Skip,
             screenshot_choice: PackChoice::LinkToShared,
             shared_dir: None,
@@ -546,6 +554,7 @@ impl MigratorApp {
         [self.voxy_choice, self.bobby_choice].contains(&CacheChoice::LinkToShared)
             || [
                 self.pack_choice,
+                self.shader_choice,
                 self.blueprint_choice,
                 self.screenshot_choice,
             ]
@@ -578,6 +587,7 @@ impl MigratorApp {
         let voxy = self.voxy_choice.to_transfer(&shared_dir)?;
         let bobby = self.bobby_choice.to_transfer(&shared_dir)?;
         let resource_packs = self.pack_choice.to_transfer(&shared_dir)?;
+        let shader_packs = self.shader_choice.to_transfer(&shared_dir)?;
         let axiom_blueprints = self.blueprint_choice.to_transfer(&shared_dir)?;
         let screenshots = self.screenshot_choice.to_transfer(&shared_dir)?;
         if !self.sync_options
@@ -586,6 +596,7 @@ impl MigratorApp {
             && voxy.is_none()
             && bobby.is_none()
             && resource_packs.is_none()
+            && shader_packs.is_none()
             && axiom_blueprints.is_none()
             && screenshots.is_none()
         {
@@ -601,6 +612,7 @@ impl MigratorApp {
             voxy,
             bobby,
             resource_packs,
+            shader_packs,
             axiom_blueprints,
             screenshots,
             report_mod_changes: true,
@@ -870,9 +882,10 @@ impl MigratorApp {
             }
         });
 
-        section(ui, "材质包、蓝图与截图", |ui| {
+        section(ui, "材质包、光影、蓝图与截图", |ui| {
             for (kind, choice) in [
                 (SharedAsset::ResourcePacks, &mut self.pack_choice),
+                (SharedAsset::ShaderPacks, &mut self.shader_choice),
                 (SharedAsset::AxiomBlueprints, &mut self.blueprint_choice),
                 (SharedAsset::Screenshots, &mut self.screenshot_choice),
             ] {

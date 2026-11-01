@@ -33,6 +33,7 @@ pub struct AssetSyncOutcome {
 pub fn asset_dir(kind: SharedAsset) -> &'static str {
     match kind {
         SharedAsset::ResourcePacks => "resourcepacks",
+        SharedAsset::ShaderPacks => "shaderpacks",
         SharedAsset::AxiomBlueprints => "config/axiom/blueprints",
         SharedAsset::Screenshots => "screenshots",
     }
@@ -41,16 +42,17 @@ pub fn asset_dir(kind: SharedAsset) -> &'static str {
 fn shared_subdir(kind: SharedAsset) -> &'static str {
     match kind {
         SharedAsset::ResourcePacks => "resourcepacks",
+        SharedAsset::ShaderPacks => "shaderpacks",
         SharedAsset::AxiomBlueprints => "axiom-blueprints",
         SharedAsset::Screenshots => "screenshots",
     }
 }
 
-/// 材质包目录中的每个文件或文件夹都是一个材质包；蓝图目录只处理 `.bp` 文件，排序文件由调用方单独合并；
-/// 截图目录只处理文件。
+/// 材质包目录中的每个文件或文件夹都是一个材质包；光影包目录中的光影包与 `<光影包名>.txt` 设置文件都要处理；
+/// 蓝图目录只处理 `.bp` 文件，排序文件由调用方单独合并；截图目录只处理文件。
 fn is_asset_entry(kind: SharedAsset, path: &Path) -> bool {
     match kind {
-        SharedAsset::ResourcePacks => true,
+        SharedAsset::ResourcePacks | SharedAsset::ShaderPacks => true,
         SharedAsset::Screenshots => path.is_file(),
         SharedAsset::AxiomBlueprints => {
             path.is_file()
@@ -415,7 +417,7 @@ fn describe_entry(kind: SharedAsset, path: &Path, owner: &str) -> Result<PackVer
     };
     // 版本号只用于帮助用户比较，读取失败时显示为未知
     let data_version = match kind {
-        SharedAsset::ResourcePacks | SharedAsset::Screenshots => None,
+        SharedAsset::ResourcePacks | SharedAsset::ShaderPacks | SharedAsset::Screenshots => None,
         SharedAsset::AxiomBlueprints => read_blueprint_data_version(path).ok(),
     };
     Ok(PackVersion {
@@ -811,6 +813,44 @@ mod tests {
             assert!(shots.join("2026-09-03_00.52.14.png").is_file());
             assert!(shots.join("2026-10-30_21.00.00.png").is_file());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shader_copy_includes_pack_folders_and_settings_files() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
+        let kind = SharedAsset::ShaderPacks;
+        let template_dir = TempDir::new("shaders-template")?;
+        let target_dir = TempDir::new("shaders-target")?;
+        write_asset(kind, template_dir.path(), "BSL.zip", b"pack")?;
+        write_asset(kind, template_dir.path(), "BSL.zip.txt", b"SHADOW=true")?;
+        let folder_pack = template_dir.path().join(asset_dir(kind)).join("Folder");
+        fs::create_dir_all(folder_pack.join("shaders"))?;
+        fs::write(folder_pack.join("shaders/final.fsh"), "void main() {}")?;
+
+        let mut seen = Vec::new();
+        let outcome = sync_shared_assets(
+            &AssetSyncRequest {
+                kind,
+                template: &instance(&template_dir, "旧包"),
+                target: &instance(&target_dir, "新包"),
+                method: &PackTransfer::CopyMissing,
+                max_data_version: None,
+            },
+            &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
+            &mut journal,
+            &mut LogSink::new(&mut |_| {}),
+        )?;
+
+        let shaders = target_dir.path().join(asset_dir(kind));
+        assert!(seen.is_empty());
+        assert_eq!(outcome.result.changed_paths.len(), 3);
+        assert!(shaders.join("BSL.zip").is_file());
+        assert_eq!(
+            fs::read_to_string(shaders.join("BSL.zip.txt"))?,
+            "SHADOW=true"
+        );
+        assert!(shaders.join("Folder/shaders/final.fsh").is_file());
         Ok(())
     }
 

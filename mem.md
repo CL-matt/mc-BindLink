@@ -4,7 +4,7 @@
 - **核心诉求**：解决玩家在跨版本（如 1.20 到 1.21 等）、切整合包时需重复设置大量按键的痛点。
 - **形态方案**：基于 **Rust (eframe / egui)** 构建的单文件独立桌面应用（零运行时依赖、秒级冷启动、极小分发体积）。
 - **软件名称**：BindLink，中文名"键链"，取"按键绑定（Bind）+ 链接（Link）"之意；仓库名与 Cargo 包名保持 `mc-bindsync`，生成的可执行文件名为 `bindlink.exe`（`Cargo.toml` 的 `[[bin]]` 配置）。
-- **版本号**：在 `Cargo.toml` 的 `version` 中维护，当前为 `1.0.0+0109`（`+` 后为构建标识，语义化版本不允许数字段带前导零，因此 0103 放在构建标识中）；窗口标题通过 `CARGO_PKG_VERSION` 显示为 `BindLink 键链 v<版本号>`，界面内标题栏不显示版本号。每完成并验证通过一个功能修改，把 `+` 后的四位构建号加 1（如 `0104` 之后为 `0105`），与该功能的代码在同一次提交中修改。
+- **版本号**：在 `Cargo.toml` 的 `version` 中维护，当前为 `1.0.0+0110`（`+` 后为构建标识，语义化版本不允许数字段带前导零，因此 0103 放在构建标识中）；窗口标题通过 `CARGO_PKG_VERSION` 显示为 `BindLink 键链 v<版本号>`，界面内标题栏不显示版本号。每完成并验证通过一个功能修改，把 `+` 后的四位构建号加 1（如 `0104` 之后为 `0105`），与该功能的代码在同一次提交中修改。
 - **标志**：两个互扣的圆角方形键帽，绿色 `#4C9162` 代表模板实例，深灰 `#2F3B45` 代表目标实例，右上交叉处绿色压在深灰之上形成链环。矢量原稿为 `logos/bindlink.svg`（64×64 视图），`logos/bindlink-256.png` 按同一几何参数绘制，用作窗口图标与标题栏标志；修改标志时两者必须同步更新。
 - **支持启动器**：适配国内主流的 **PCL2**，兼容全局根目录与版本隔离实例；HMCL 适配列入 [todolist.md](todolist.md)。
 
@@ -93,10 +93,10 @@
   | nekovc | 全量覆写 | Junction 指向共享目录（默认为目标实例下的 `bindlink-shared`，可改选） |
 
 - 每次迁移结束时按 Mod ID 对比模板（旧）与目标（新）实例的 `mods/`，在弹窗与日志中列出版本变化、新增（仅目标有）与移除（仅模板有）的 Mod。版本号取自元数据的 `version`；为空或为 `${...}` 占位符时改读 jar 内 `META-INF/MANIFEST.MF` 的 `Implementation-Version`，仍没有则显示"未知"。
-- 固定配置不修改材质包的处理方式；Axiom 蓝图的处理方式统一设为"不处理"；截图统一设为"Junction 指向共享目录"。
+- 固定配置不修改材质包与光影包的处理方式；Axiom 蓝图的处理方式统一设为"不处理"；截图统一设为"Junction 指向共享目录"。
 
 ### 2.7 材质包同步 (`pack_sync.rs`)
-- 目录：实例的 `resourcepacks/`，其中每个 `.zip` 文件或文件夹为一个材质包。光影包（`shaderpacks/`）不同步。
+- 目录：实例的 `resourcepacks/`，其中每个 `.zip` 文件或文件夹为一个材质包。光影包见 §2.12。
 - Junction 只能链接文件夹，单个 zip 无法免权限跨分区链接，因此共享时以整个 `resourcepacks/` 目录为单位。
 - 处理方式由用户选择：
   - 不处理。
@@ -125,7 +125,7 @@
 
 ### 2.10 共享目录结构
 - 默认位置为目标实例所属 `.minecraft` 下的 `bindlink-shared`，即迁移后继续使用的实例旁边；模板实例在其他磁盘时，首次共享会把内容复制到共享目录后删除原目录（`rename` 返回 `CrossesDevices` 时回退为复制，已在 C 盘与 F 盘之间实测）；目录在迁移确实用到时才由各同步步骤创建。用户可在界面中改选其他目录，或恢复默认；手动选择不跨次保存。
-- Voxy、Bobby、材质包、Axiom 蓝图与截图共用同一个共享目录，按种类分子目录：
+- Voxy、Bobby、材质包、光影包、Axiom 蓝图与截图共用同一个共享目录，按种类分子目录：
 
   ```
   bindlink-shared\
@@ -133,6 +133,8 @@
   ├─ bobby\<服务器地址>\
   ├─ resourcepacks\
   ├─ resourcepacks.bak\
+  ├─ shaderpacks\
+  ├─ shaderpacks.bak\
   ├─ axiom-blueprints\
   ├─ axiom-blueprints.bak\
   ├─ screenshots\
@@ -150,6 +152,16 @@
 - 回退中途失败（例如游戏仍在运行）时保存尚未撤销的部分，处理掉失败原因后可再次回退；全部撤销后删除该记录。
 - 界面左侧"迁移历史"卡片列出尚未回退的记录，只有最新一条提供"回退"按钮，点击后需在确认窗口中再次确认。
 
+### 2.12 光影包同步 (`pack_sync.rs`、`engine.rs`)
+- 目录（已在 PCL 实例中实测）：`shaderpacks/`，其中的 `.zip` 文件或文件夹为光影包；Iris 与 OptiFine 把每个光影包的选项保存为同目录下的 `<光影包文件名>.txt`。目录中的所有文件与文件夹都参与同步，设置文件随光影包一起复制或并入共享目录。
+- 复制、共享、同名冲突与备份规则与 §2.7 相同；共享目录为 `<共享目录>\shaderpacks`，复制模式备份到 `shaderpacks.bak/`，共享模式备份到 `<共享目录>\shaderpacks.bak\`，共享时目标原有的剩余文件整体重命名为 `shaderpacks.<unix秒>.bak`。
+- 当前光影：光影包同步之后，复制与共享两种模式都把模板的当前光影写入目标：
+  - Iris：`config/iris.properties` 的 `shaderPack` 与 `enableShaders`。
+  - OptiFine：`optionsshaders.txt` 的 `shaderPack`；`OFF`（关闭光影）与 `(internal)`（内置光影）不对应文件。
+  - 两个文件均为 Java properties 格式（实测 Iris 把非 ASCII 字符写成 `\uXXXX`），值按原文照搬，判断光影包是否存在时先还原转义；其他条目与 `#` 注释行保持不变。
+  - 只处理模板与目标都已存在的文件，目标缺少时提示先在目标实例中启动一次游戏。模板选中的光影包不在目标的 `shaderpacks/` 中（例如模板中已删除该光影包，或光影包同步步骤失败）时保留目标原有选择，避免游戏找不到光影包。写入前按 §4 备份。
+- 界面默认"不处理"，固定配置不修改此项。
+
 ---
 
 ## 3. 技术栈与模块设计
@@ -165,7 +177,7 @@
 - `src/engine.rs`: 核心业务逻辑（`options.txt` 解析、Mod 检测、配置读写与备份）。
 - `src/launcher.rs`: 启动器路径嗅探、隔离版本扫描。
 - `src/map_sync.rs`: 地图路点目录递归同步与 Voxy、Bobby 缓存链接或拷贝；同时提供 Junction、移动、占用检测等目录操作供 `pack_sync.rs` 复用。
-- `src/pack_sync.rs`: 材质包、Axiom 蓝图与截图的复制、合并到共享目录、同名冲突处理，以及蓝图数据版本读取。
+- `src/pack_sync.rs`: 材质包、光影包、Axiom 蓝图与截图的复制、合并到共享目录、同名冲突处理，以及蓝图数据版本读取。
 - `src/journal.rs`: 迁移记录与回退，迁移中所有改动文件系统的操作都经由其中的 `Journal` 执行。
 - `src/log_file.rs`: 把界面日志同时写入 `%APPDATA%\BindLink\logs\bindlink-<毫秒时间戳>.log`，每次启动一个文件，保留最近 20 个；时间统一用 UTC；日志区"清空"按钮左侧的"打开日志文件夹"用资源管理器打开该目录。界面中的所有日志都必须经由 `add_logs` 进入，保证与文件一致。日志文件可能被公开附在问题反馈中，写入前脱敏，界面日志保持原样：Windows 用户目录替换为 `%USERPROFILE%`，扫描到的各 `.minecraft` 目录按顺序替换为 `<游戏目录N>`，手动选择的共享目录替换为 `<共享目录>`，服务器地址替换为 `服务器-<8 位十六进制>`（地址转小写后取 64 位 FNV-1a 哈希的高 32 位，同一地址在任何日志中代号相同、不可还原）。服务器地址取自各实例 Xaero 的 `Multiplayer_<地址>` 目录与 Voxy、Bobby 的缓存目录，只认含 `.` 或 `:` 且不少于 4 个字符的名称。
 - `src/elevation.rs`: 写入权限检查与以管理员身份重新启动。程序默认以普通权限运行；选择目标实例（或更换模板、目标）时以及开始迁移前，检查目标实例目录、用到的共享目录与共享模式下会被移动内容的模板实例目录能否写入（实际创建并删除一个临时文件，尚不存在的目录检查最近的已存在上级目录）。有不可写目录时弹窗列出并提供"以管理员身份重新启动"，开始迁移前检测到时取消迁移。重启通过 PowerShell `Start-Process -Verb RunAs` 完成，并以 `--dir`、`--template`、`--target` 参数恢复已添加的目录与已选实例；用户在 UAC 中拒绝时保留当前窗口。
@@ -176,7 +188,7 @@
 ### 核心数据结构
 - `DetectedInstance` 包含 `minecraft_root`（所属 `.minecraft` 根目录，决定默认共享目录位置；模板与目标可以来自不同根目录或不同磁盘）与 `launcher: LauncherKind` 字段，`LauncherKind` 取值为 `Pcl2 / Unknown`，定义在 `src/types.rs`。
 - `ServerCache`（`Voxy / Bobby`）标识缓存种类，`CacheTransfer`（`Copy / LinkToSource / LinkToShared(共享目录)`）表示迁移方式；`MigrationRequest` 的 `voxy`、`bobby` 字段各为 `Option<CacheTransfer>`，`None` 表示不处理。
-- `SharedAsset`（`ResourcePacks / AxiomBlueprints / Screenshots`）标识资源种类；`PackTransfer`（`CopyMissing / LinkToShared(共享目录)`）表示处理方式，对应 `MigrationRequest.resource_packs`、`MigrationRequest.axiom_blueprints` 与 `MigrationRequest.screenshots`；同名冲突以 `PackConflict`（种类、名称、`existing` 与 `incoming` 两个 `PackVersion`：来源、大小、修改时间、蓝图数据版本）交给界面，用户返回 `ConflictChoice`（`KeepExisting / UseIncoming`）。后台线程通过消息把冲突发给界面并阻塞等待回复。
+- `SharedAsset`（`ResourcePacks / ShaderPacks / AxiomBlueprints / Screenshots`）标识资源种类；`PackTransfer`（`CopyMissing / LinkToShared(共享目录)`）表示处理方式，对应 `MigrationRequest.resource_packs`、`MigrationRequest.shader_packs`、`MigrationRequest.axiom_blueprints` 与 `MigrationRequest.screenshots`；同名冲突以 `PackConflict`（种类、名称、`existing` 与 `incoming` 两个 `PackVersion`：来源、大小、修改时间、蓝图数据版本）交给界面，用户返回 `ConflictChoice`（`KeepExisting / UseIncoming`）。后台线程通过消息把冲突发给界面并阻塞等待回复。
 - 业务模块通过 `LogSink` 输出 `LogEntry`（`LogLevel`：`Info / Skip / Success / Warning / Error`），界面据此着色：跳过的操作用 `Skip`，已写入、复制或链接用 `Success`，单个条目失败用 `Warning`，整个步骤失败用 `Error`。
 - `src/test_support.rs` 仅在测试编译时引入，提供测试用临时目录。
 
@@ -194,7 +206,7 @@
   - 目标旁不存在 `<文件>.bak` 时生成该文件，作为最早的原始备份永不覆盖。
   - 已存在 `<文件>.bak` 时生成 `<文件>.<unix秒>.bak`，同一文件仅保留最近 5 份带时间戳的备份。
   - 时间戳使用标准库 `std::time::SystemTime` 生成，不引入 `chrono`。
-  - 例外：地图与路点目录（§2.5）文件数量大，豁免逐文件 `.bak` 备份；同步前必须在日志中列出将被覆盖的文件，被覆盖文件的迁移前版本保存在迁移记录中（§2.11）。Voxy 与 Bobby 缓存目录按 §2.5 整目录重命名备份；材质包、Axiom 蓝图与截图按 §2.7、§2.8、§2.9 移入同级 `.bak` 目录或整体重命名备份。
+  - 例外：地图与路点目录（§2.5）文件数量大，豁免逐文件 `.bak` 备份；同步前必须在日志中列出将被覆盖的文件，被覆盖文件的迁移前版本保存在迁移记录中（§2.11）。Voxy 与 Bobby 缓存目录按 §2.5 整目录重命名备份；材质包、Axiom 蓝图、截图与光影包按 §2.7、§2.8、§2.9、§2.12 移入同级 `.bak` 目录或整体重命名备份。
 - **容错防崩**：遇到破损的 `.jar`、格式不规范的 JSON/TOML 时跳过并记录日志，不得触发 `panic!`。
 - **无黑框分发**：发布模式需开启 `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`。
 

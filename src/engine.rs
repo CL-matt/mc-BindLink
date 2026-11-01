@@ -37,6 +37,17 @@ const FULL_OVERWRITE_BLACKLIST: &[&str] = &[
 const MAX_TIMESTAMPED_BACKUPS: usize = 5;
 /// `options.txt` 中记录已启用材质包的条目。
 const ENABLED_PACK_KEYS: &[&str] = &["resourcePacks", "incompatibleResourcePacks"];
+const SHADER_PACK_KEY: &str = "shaderPack";
+/// 记录当前光影的配置文件（相对游戏目录）与需要照搬的条目：Iris 与 OptiFine 各一个，均为 Java properties 格式。
+const SHADER_SELECTION_FILES: &[(&str, &[&str])] = &[
+    (
+        "config/iris.properties",
+        &[SHADER_PACK_KEY, "enableShaders"],
+    ),
+    ("optionsshaders.txt", &[SHADER_PACK_KEY]),
+];
+/// 不对应 `shaderpacks/` 中文件的取值：未选择、OptiFine 的关闭光影与内置光影。
+const BUILTIN_SHADER_VALUES: &[&str] = &["", "OFF", "(internal)"];
 const AXIOM_MOD_ID: &str = "axiom";
 /// Axiom 蓝图界面的排列顺序，每行一个蓝图文件名。
 const BLUEPRINT_ORDERING_FILE: &str = ".axiom_blueprint_ordering";
@@ -140,6 +151,24 @@ pub fn run_migration(
                 sync_enabled_pack_list(template_dir, target_dir, journal, log, &mut result);
             record_step_failure("材质包启用列表同步", outcome, log, &mut result);
         }
+    }
+    if let Some(method) = &request.shader_packs {
+        let outcome = pack_sync::sync_shared_assets(
+            &AssetSyncRequest {
+                kind: SharedAsset::ShaderPacks,
+                template: &request.template,
+                target: &request.target,
+                method,
+                max_data_version: None,
+            },
+            resolve,
+            journal,
+            log,
+        )
+        .map(|step| merge_result(&mut result, step.result));
+        record_step_failure("光影包同步", outcome, log, &mut result);
+        let outcome = sync_selected_shader(template_dir, target_dir, journal, log, &mut result);
+        record_step_failure("当前光影同步", outcome, log, &mut result);
     }
     if let Some(method) = &request.axiom_blueprints {
         let outcome = sync_axiom_blueprints(request, method, resolve, journal, log, &mut result);
@@ -321,33 +350,52 @@ enum OptionLine {
     Raw(String),
 }
 
-/// 按行保存的 `options.txt`，保留原有条目顺序、无法解析的行与换行符。
+/// 按行保存的 `options.txt` 或 Java properties 文件，保留原有条目顺序、无法解析的行与换行符。
 #[derive(Debug, Clone)]
 struct OptionsFile {
     lines: Vec<OptionLine>,
     line_ending: &'static str,
+    /// `options.txt` 为 `:`，properties 文件为 `=`。
+    separator: char,
 }
 
 impl OptionsFile {
     fn parse(text: &str) -> Self {
+        Self::parse_with_separator(text, ':')
+    }
+
+    /// 解析 properties 文件，`#` 或 `!` 开头的注释行原样保留；值保持转义后的原文，
+    /// 需要文件名时用 `unescape_properties_value` 还原。
+    fn parse_properties(text: &str) -> Self {
+        Self::parse_with_separator(text, '=')
+    }
+
+    fn parse_with_separator(text: &str, separator: char) -> Self {
         let line_ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let is_comment = |line: &str| separator == '=' && line.trim_start().starts_with(['#', '!']);
         let lines = text
             .lines()
-            .map(|line| match line.split_once(':') {
-                Some((key, value)) if !key.is_empty() => OptionLine::Entry {
+            .map(|line| match line.split_once(separator) {
+                Some((key, value)) if !key.is_empty() && !is_comment(line) => OptionLine::Entry {
                     key: key.to_string(),
                     value: value.to_string(),
                 },
                 _ => OptionLine::Raw(line.to_string()),
             })
             .collect();
-        Self { lines, line_ending }
+        Self {
+            lines,
+            line_ending,
+            separator,
+        }
     }
 
     fn load(path: &Path) -> Result<Self> {
-        let text =
-            fs::read_to_string(path).with_context(|| format!("读取 {} 失败", path.display()))?;
-        Ok(Self::parse(&text))
+        Ok(Self::parse(&read_text(path)?))
+    }
+
+    fn load_properties(path: &Path) -> Result<Self> {
+        Ok(Self::parse_properties(&read_text(path)?))
     }
 
     fn to_text(&self) -> String {
@@ -356,7 +404,7 @@ impl OptionsFile {
             match line {
                 OptionLine::Entry { key, value } => {
                     text.push_str(key);
-                    text.push(':');
+                    text.push(self.separator);
                     text.push_str(value);
                 }
                 OptionLine::Raw(raw) => text.push_str(raw),
@@ -518,6 +566,105 @@ fn sync_enabled_pack_list(
     journal.write_file(&target_path, target.to_text())?;
     log.success("材质包启用列表：已按模板更新".to_string());
     result.changed_paths.push(target_path);
+    Ok(())
+}
+
+fn read_text(path: &Path) -> Result<String> {
+    fs::read_to_string(path).with_context(|| format!("读取 {} 失败", path.display()))
+}
+
+/// 还原 Java properties 值中的转义：`\uXXXX` 与 `\t`、`\n` 等，其余 `\x` 还原为 `x`。
+fn unescape_properties_value(raw: &str) -> String {
+    let mut value = String::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            value.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) => value.push(decoded),
+                    None => {
+                        value.push_str("\\u");
+                        value.push_str(&hex);
+                    }
+                }
+            }
+            Some('t') => value.push('\t'),
+            Some('n') => value.push('\n'),
+            Some('r') => value.push('\r'),
+            Some('f') => value.push('\u{000C}'),
+            Some(other) => value.push(other),
+            None => value.push('\\'),
+        }
+    }
+    value
+}
+
+/// 把模板的当前光影（Iris 的 `shaderPack` 与 `enableShaders`，OptiFine 的 `shaderPack`）写入目标。
+///
+/// 只处理两个实例都已有的配置文件；模板选中的光影包不在目标的 `shaderpacks/` 中时保留目标原有选择，
+/// 避免游戏启动后找不到光影包。
+fn sync_selected_shader(
+    template_dir: &Path,
+    target_dir: &Path,
+    journal: &mut Journal,
+    log: &mut LogSink,
+    result: &mut MigrationResult,
+) -> Result<()> {
+    let mut found = false;
+    for &(relative, keys) in SHADER_SELECTION_FILES {
+        let template_path = template_dir.join(relative);
+        if !template_path.is_file() {
+            continue;
+        }
+        found = true;
+        let target_path = target_dir.join(relative);
+        if !target_path.is_file() {
+            log.skip(format!(
+                "当前光影：目标实例没有 {relative}，需先在目标实例中启动一次游戏，跳过"
+            ));
+            continue;
+        }
+        let template = OptionsFile::load_properties(&template_path)?;
+        let Some(raw_pack) = template.get(SHADER_PACK_KEY) else {
+            log.skip(format!("当前光影：模板的 {relative} 没有记录光影，跳过"));
+            continue;
+        };
+        let pack = unescape_properties_value(raw_pack.trim());
+        let pack_dir = target_dir.join(pack_sync::asset_dir(SharedAsset::ShaderPacks));
+        if !BUILTIN_SHADER_VALUES.contains(&pack.as_str()) && !pack_dir.join(&pack).exists() {
+            log.skip(format!(
+                "当前光影：目标实例的 shaderpacks 中没有 {pack}，保留目标原有选择"
+            ));
+            continue;
+        }
+        let mut target = OptionsFile::load_properties(&target_path)?;
+        let mut changed = 0;
+        for key in keys {
+            if let Some(value) = template.get(key)
+                && target.set(key, value)
+            {
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            log.skip(format!("当前光影：{relative} 与模板一致，无需修改"));
+            continue;
+        }
+        if let Some(backup) = backup_file_safely(&target_path)? {
+            log.info(format!("已备份到 {}", backup.display()));
+        }
+        journal.write_file(&target_path, target.to_text())?;
+        log.success(format!("当前光影：{relative} 已切换为 {pack}"));
+        result.changed_paths.push(target_path);
+    }
+    if !found {
+        log.skip("当前光影：模板实例没有 Iris 或 OptiFine 的光影设置，跳过".to_string());
+    }
     Ok(())
 }
 
@@ -1444,6 +1591,96 @@ mod tests {
         assert_eq!(updated.get("incompatibleResourcePacks"), Some("[]"));
         assert_eq!(updated.get("fov"), Some("0.0"));
         assert!(target.path().join("options.txt.bak").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn unescapes_properties_values() {
+        assert_eq!(
+            unescape_properties_value(r"Chocapic13_V9（SSPT）.zip"),
+            "Chocapic13_V9（SSPT）.zip"
+        );
+        assert_eq!(unescape_properties_value(r"a\:b\\c\ d"), r"a:b\c d");
+        assert_eq!(unescape_properties_value(r"bad\uZZ"), r"bad\uZZ");
+    }
+
+    #[test]
+    fn properties_keep_comments_and_line_endings() {
+        let text = "#Tue Feb 27 16:04:06 CET 2024\r\nshaderPack=a\\=b.zip\r\ncolorSpace=SRGB\r\n";
+        let mut file = OptionsFile::parse_properties(text);
+        assert_eq!(file.get("shaderPack"), Some("a\\=b.zip"));
+        assert!(file.set("shaderPack", "c.zip"));
+        assert_eq!(
+            file.to_text(),
+            "#Tue Feb 27 16:04:06 CET 2024\r\nshaderPack=c.zip\r\ncolorSpace=SRGB\r\n"
+        );
+    }
+
+    fn write_iris_properties(game_dir: &Path, pack: &str, enabled: bool) -> Result<PathBuf> {
+        let config = game_dir.join("config");
+        fs::create_dir_all(&config)?;
+        let path = config.join("iris.properties");
+        fs::write(
+            &path,
+            format!(
+                "#This file stores configuration options for Iris\n\
+                 colorSpace=SRGB\nenableShaders={enabled}\nshaderPack={pack}\n"
+            ),
+        )?;
+        Ok(path)
+    }
+
+    #[test]
+    fn selected_shader_follows_template_when_pack_is_present() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
+        let template = TempDir::new("shader-select-template")?;
+        let target = TempDir::new("shader-select-target")?;
+        write_iris_properties(template.path(), r"Chocapic13（SSPT）.zip", true)?;
+        let target_properties = write_iris_properties(target.path(), "", false)?;
+        fs::create_dir_all(target.path().join("shaderpacks"))?;
+        fs::write(
+            target.path().join("shaderpacks/Chocapic13（SSPT）.zip"),
+            "pack",
+        )?;
+
+        let mut result = MigrationResult::default();
+        sync_selected_shader(
+            template.path(),
+            target.path(),
+            &mut journal,
+            &mut LogSink::new(&mut |_| {}),
+            &mut result,
+        )?;
+
+        let updated = OptionsFile::load_properties(&target_properties)?;
+        assert_eq!(updated.get("shaderPack"), Some(r"Chocapic13（SSPT）.zip"));
+        assert_eq!(updated.get("enableShaders"), Some("true"));
+        assert_eq!(updated.get("colorSpace"), Some("SRGB"));
+        assert_eq!(result.changed_paths, vec![target_properties.clone()]);
+        assert!(target_properties.with_extension("properties.bak").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn selected_shader_kept_when_pack_is_missing_from_target() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
+        let template = TempDir::new("shader-missing-template")?;
+        let target = TempDir::new("shader-missing-target")?;
+        write_iris_properties(template.path(), "BSL.zip", true)?;
+        let target_properties = write_iris_properties(target.path(), "Old.zip", false)?;
+        let before = fs::read_to_string(&target_properties)?;
+
+        let mut result = MigrationResult::default();
+        sync_selected_shader(
+            template.path(),
+            target.path(),
+            &mut journal,
+            &mut LogSink::new(&mut |_| {}),
+            &mut result,
+        )?;
+
+        assert_eq!(fs::read_to_string(&target_properties)?, before);
+        assert!(result.changed_paths.is_empty());
         Ok(())
     }
 }

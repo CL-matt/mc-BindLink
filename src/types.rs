@@ -96,6 +96,8 @@ pub struct MigrationRequest {
     pub bobby: Option<CacheTransfer>,
     /// 为 `None` 时不处理材质包。
     pub resource_packs: Option<PackTransfer>,
+    /// 为 `None` 时不处理光影包。
+    pub shader_packs: Option<PackTransfer>,
     /// 为 `None` 时不处理 Axiom 蓝图。
     pub axiom_blueprints: Option<PackTransfer>,
     /// 为 `None` 时不处理截图。
@@ -108,6 +110,7 @@ pub struct MigrationRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedAsset {
     ResourcePacks,
+    ShaderPacks,
     AxiomBlueprints,
     Screenshots,
 }
@@ -116,6 +119,7 @@ impl fmt::Display for SharedAsset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
             SharedAsset::ResourcePacks => "材质包",
+            SharedAsset::ShaderPacks => "光影包",
             SharedAsset::AxiomBlueprints => "Axiom 蓝图",
             SharedAsset::Screenshots => "截图",
         };
@@ -123,7 +127,7 @@ impl fmt::Display for SharedAsset {
     }
 }
 
-/// 材质包与 Axiom 蓝图的迁移方式。
+/// 材质包、光影包、Axiom 蓝图与截图的迁移方式。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackTransfer {
     /// 把模板有而目标没有的条目复制到目标。
@@ -139,11 +143,11 @@ pub struct PackVersion {
     pub owner: String,
     pub size: u64,
     pub modified: Option<SystemTime>,
-    /// 蓝图保存时的游戏数据版本号；材质包或读取失败时为 `None`。
+    /// 蓝图保存时的游戏数据版本号；其他资源或读取失败时为 `None`。
     pub data_version: Option<i64>,
 }
 
-/// 两个同名但内容不同的材质包或蓝图。
+/// 两个同名但内容不同的资源条目。
 #[derive(Debug, Clone)]
 pub struct PackConflict {
     pub kind: SharedAsset,

@@ -496,6 +496,7 @@ mod tests {
             voxy: Some(CacheTransfer::LinkToShared(shared.path().to_path_buf())),
             bobby: None,
             resource_packs: Some(PackTransfer::LinkToShared(shared.path().to_path_buf())),
+            shader_packs: None,
             axiom_blueprints: None,
             screenshots: Some(PackTransfer::CopyMissing),
             report_mod_changes: false,
