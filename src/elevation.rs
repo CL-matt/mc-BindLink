@@ -15,6 +15,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ARG_DIR: &str = "--dir";
 const ARG_TEMPLATE: &str = "--template";
 const ARG_TARGET: &str = "--target";
+const ARG_SHARED_DIR: &str = "--shared-dir";
+const ARG_GROUP: &str = "--group";
 
 /// 返回 `dirs` 中当前进程无法写入的目录（去重，保持原顺序）。
 ///
@@ -54,6 +56,10 @@ pub struct StartupArgs {
     /// 模板与目标实例的游戏目录，重启后据此重新选中。
     pub template: Option<PathBuf>,
     pub target: Option<PathBuf>,
+    /// 手动选择或自动沿用的共享目录，为 `None` 时使用默认位置。
+    pub shared_dir: Option<PathBuf>,
+    /// 已填写的共享组名称。
+    pub group: Option<String>,
 }
 
 impl StartupArgs {
@@ -69,6 +75,8 @@ impl StartupArgs {
                 Some(ARG_DIR) => parsed.dirs.push(value),
                 Some(ARG_TEMPLATE) => parsed.template = Some(value),
                 Some(ARG_TARGET) => parsed.target = Some(value),
+                Some(ARG_SHARED_DIR) => parsed.shared_dir = Some(value),
+                Some(ARG_GROUP) => parsed.group = Some(value.to_string_lossy().into_owned()),
                 _ => {}
             }
         }
@@ -85,6 +93,12 @@ impl StartupArgs {
         }
         if let Some(target) = &self.target {
             args.extend([ARG_TARGET.to_string(), target.display().to_string()]);
+        }
+        if let Some(shared_dir) = &self.shared_dir {
+            args.extend([ARG_SHARED_DIR.to_string(), shared_dir.display().to_string()]);
+        }
+        if let Some(group) = &self.group {
+            args.extend([ARG_GROUP.to_string(), group.clone()]);
         }
         args
     }
@@ -131,6 +145,8 @@ mod tests {
             dirs: vec![PathBuf::from(r"D:\Games\My PCL"), PathBuf::from(r"E:\mc")],
             template: Some(PathBuf::from(r"D:\Games\My PCL\.minecraft\versions\old")),
             target: Some(PathBuf::from(r"D:\Games\My PCL\.minecraft\versions\new")),
+            shared_dir: Some(PathBuf::from(r"D:\Games\My PCL\.minecraft\bindlink-shared")),
+            group: Some("neko 1.20.1".to_string()),
         };
         let parsed = StartupArgs::parse(original.to_args().into_iter().map(OsString::from));
         assert_eq!(parsed, original);

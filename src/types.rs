@@ -78,6 +78,7 @@ pub enum CacheTransfer {
     /// 目标建立 Junction 指向源实例的缓存目录。
     LinkToSource,
     /// 先把源缓存移动到共享目录，源与目标都建立 Junction 指向该目录。
+    /// 路径为内容所在的目录：通用时为共享目录本身，隔离时为其下的共享组目录。
     LinkToShared(PathBuf),
 }
 
@@ -127,12 +128,48 @@ impl fmt::Display for SharedAsset {
     }
 }
 
+/// 可通过共享目录共用的一项内容，用于选择隔离（放在共享组下）还是通用（放在共享目录根下）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShareItem {
+    Voxy,
+    Bobby,
+    ResourcePacks,
+    ShaderPacks,
+    AxiomBlueprints,
+    Screenshots,
+}
+
+impl ShareItem {
+    pub const ALL: [ShareItem; 6] = [
+        ShareItem::Voxy,
+        ShareItem::Bobby,
+        ShareItem::ResourcePacks,
+        ShareItem::ShaderPacks,
+        ShareItem::AxiomBlueprints,
+        ShareItem::Screenshots,
+    ];
+}
+
+impl fmt::Display for ShareItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShareItem::Voxy => write!(f, "{} 缓存", ServerCache::Voxy),
+            ShareItem::Bobby => write!(f, "{} 缓存", ServerCache::Bobby),
+            ShareItem::ResourcePacks => SharedAsset::ResourcePacks.fmt(f),
+            ShareItem::ShaderPacks => SharedAsset::ShaderPacks.fmt(f),
+            ShareItem::AxiomBlueprints => SharedAsset::AxiomBlueprints.fmt(f),
+            ShareItem::Screenshots => SharedAsset::Screenshots.fmt(f),
+        }
+    }
+}
+
 /// 材质包、光影包、Axiom 蓝图与截图的迁移方式。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackTransfer {
     /// 把模板有而目标没有的条目复制到目标。
     CopyMissing,
     /// 把模板与目标的条目合并进共享目录，两个实例都建立 Junction 指向该目录。
+    /// 路径为内容所在的目录：通用时为共享目录本身，隔离时为其下的共享组目录。
     LinkToShared(PathBuf),
 }
 

@@ -39,7 +39,7 @@ pub fn asset_dir(kind: SharedAsset) -> &'static str {
     }
 }
 
-fn shared_subdir(kind: SharedAsset) -> &'static str {
+pub fn shared_subdir(kind: SharedAsset) -> &'static str {
     match kind {
         SharedAsset::ResourcePacks => "resourcepacks",
         SharedAsset::ShaderPacks => "shaderpacks",
@@ -234,19 +234,33 @@ fn link_instance_assets(
     }
 
     let mut added = Vec::new();
-    if instance_dir.exists() {
-        // 实例目录若已链接到别处，合并会改动其他实例正在使用的目录
-        if is_link(&instance_dir)? {
-            bail!(
-                "{} 的 {} 是指向 {} 的链接，无法合并到共享目录",
-                instance.name,
-                asset_dir(kind),
-                resolve_real_path(&instance_dir)?.display()
-            );
-        }
+    if instance_dir.exists() && is_link(&instance_dir)? {
+        // 已链接到别处（例如从通用目录改为共享组）时，移走其中内容会影响其他实例，
+        // 因此复制到共享目录后改指向，原位置保持不变
+        let previous = resolve_real_path(&instance_dir)?;
+        fs::create_dir_all(shared)
+            .with_context(|| format!("创建目录 {} 失败", shared.display()))?;
+        let source = MergeSource {
+            owner: &instance.name,
+            dir: &previous,
+            transfer: Transfer::Copy,
+        };
+        added = merge_into_shared(kind, &source, shared, shared_root, resolve, journal, log)?;
+        journal.remove_junction(&instance_dir)?;
+        log.info(format!(
+            "{kind}：{} 原先链接到 {}，其中内容已复制，原位置保持不变",
+            instance.name,
+            previous.display()
+        ));
+    } else if instance_dir.exists() {
         ensure_cache_not_in_use(&instance_dir)?;
         if shared.exists() {
-            added = merge_into_shared(kind, instance, shared, shared_root, resolve, journal, log)?;
+            let source = MergeSource {
+                owner: &instance.name,
+                dir: &instance_dir,
+                transfer: Transfer::Move,
+            };
+            added = merge_into_shared(kind, &source, shared, shared_root, resolve, journal, log)?;
             set_aside_leftovers(kind, &instance_dir, journal, log)?;
         } else {
             fs::create_dir_all(shared_root)
@@ -284,19 +298,41 @@ fn link_instance_assets(
     Ok(Some(added))
 }
 
+/// 并入共享目录的方式：实例自己的目录移入；实例原先链接到的其他共享位置只复制，不改动原位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transfer {
+    Move,
+    Copy,
+}
+
+struct MergeSource<'a> {
+    /// 冲突弹窗中显示的来源，即实例名。
+    owner: &'a str,
+    dir: &'a Path,
+    transfer: Transfer,
+}
+
+impl Transfer {
+    fn apply(self, from: &Path, to: &Path, journal: &mut Journal) -> Result<()> {
+        match self {
+            Transfer::Move => journal.move_path(from, to),
+            Transfer::Copy => journal.copy_entry(from, to),
+        }
+    }
+}
+
 fn merge_into_shared(
     kind: SharedAsset,
-    instance: &DetectedInstance,
+    source: &MergeSource,
     shared: &Path,
     shared_root: &Path,
     resolve: &mut ConflictResolver,
     journal: &mut Journal,
     log: &mut LogSink,
 ) -> Result<Vec<String>> {
-    let instance_dir = instance.game_dir.join(asset_dir(kind));
     let mut moves = Vec::new();
     let mut conflicts = Vec::new();
-    for (name, path) in list_assets(kind, &instance_dir)? {
+    for (name, path) in list_assets(kind, source.dir)? {
         let destination = shared.join(&name);
         if !destination.exists() {
             moves.push((name, path, destination));
@@ -308,11 +344,11 @@ fn merge_into_shared(
             });
         }
     }
-    let choices = ask_user(kind, &conflicts, SHARED_OWNER, &instance.name, resolve)?;
+    let choices = ask_user(kind, &conflicts, SHARED_OWNER, source.owner, resolve)?;
 
     let mut added = Vec::new();
     for (name, path, destination) in moves {
-        journal.move_path(&path, &destination)?;
+        source.transfer.apply(&path, &destination, journal)?;
         added.push(name);
     }
     let backup_dir = shared_root.join(format!("{}.bak", shared_subdir(kind)));
@@ -322,17 +358,19 @@ fn merge_into_shared(
         }
         ensure_cache_not_in_use(&conflict.existing)?;
         let backup = move_to_backup(&conflict.existing, &backup_dir, journal)?;
-        journal.move_path(&conflict.incoming, &conflict.existing)?;
+        source
+            .transfer
+            .apply(&conflict.incoming, &conflict.existing, journal)?;
         log.success(format!(
             "{kind}：共享目录中的 {} 已替换为 {} 的版本，原版本移至 {}",
             conflict.name,
-            instance.name,
+            source.owner,
             backup.display()
         ));
     }
     log.success(format!(
         "{kind}：已将 {} 的 {} 个条目并入共享目录",
-        instance.name,
+        source.owner,
         added.len()
     ));
     Ok(added)
@@ -851,6 +889,57 @@ mod tests {
             "SHADOW=true"
         );
         assert!(shaders.join("Folder/shaders/final.fsh").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn moving_screenshots_from_common_to_group_copies_and_rollback_restores_link() -> Result<()> {
+        let (history, mut journal) = test_journal()?;
+        let kind = SharedAsset::Screenshots;
+        let template_dir = TempDir::new("shots-regroup-template")?;
+        let target_dir = TempDir::new("shots-regroup-target")?;
+        let shared_root = TempDir::new("shots-regroup-store")?;
+        let common = shared_root.path().join(shared_subdir(kind));
+        fs::create_dir_all(&common)?;
+        fs::write(common.join("other-instance.png"), "other")?;
+        let template_shots = template_dir.path().join(asset_dir(kind));
+        crate::fs_ops::create_junction(&template_shots, &common)?;
+        write_asset(kind, target_dir.path(), "target.png", b"target")?;
+        let group = shared_root.path().join("neko");
+
+        let mut seen = Vec::new();
+        sync_shared_assets(
+            &AssetSyncRequest {
+                kind,
+                template: &instance(&template_dir, "旧包"),
+                target: &instance(&target_dir, "新包"),
+                method: &PackTransfer::LinkToShared(group.clone()),
+                max_data_version: None,
+            },
+            &mut answer_all(ConflictChoice::KeepExisting, &mut seen),
+            &mut journal,
+            &mut LogSink::new(&mut |_| {}),
+        )?;
+
+        let group_shots = resolve_real_path(&group.join(shared_subdir(kind)))?;
+        assert_eq!(resolve_real_path(&template_shots)?, group_shots);
+        assert!(group_shots.join("other-instance.png").is_file());
+        assert!(group_shots.join("target.png").is_file());
+        assert!(common.join("other-instance.png").is_file());
+        assert!(!common.join("target.png").exists());
+
+        journal.finish()?;
+        let record = crate::journal::list_history(history.path())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("没有迁移记录"))?;
+        crate::journal::rollback(&record.dir, &mut LogSink::new(&mut |_| {}))?;
+        assert!(is_link(&template_shots)?);
+        assert_eq!(
+            resolve_real_path(&template_shots)?,
+            resolve_real_path(&common)?
+        );
+        assert!(common.join("other-instance.png").is_file());
         Ok(())
     }
 

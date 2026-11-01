@@ -154,7 +154,7 @@ pub fn list_server_names(game_dir: &Path) -> Vec<String> {
     names
 }
 
-fn cache_root(kind: ServerCache) -> &'static str {
+pub fn cache_root(kind: ServerCache) -> &'static str {
     match kind {
         ServerCache::Voxy => ".voxy/saves",
         ServerCache::Bobby => ".bobby",
@@ -162,7 +162,7 @@ fn cache_root(kind: ServerCache) -> &'static str {
 }
 
 /// 共享目录下按缓存种类分子目录，避免 Voxy 与 Bobby 的同名服务器目录互相冲突。
-fn shared_subdir(kind: ServerCache) -> &'static str {
+pub fn shared_subdir(kind: ServerCache) -> &'static str {
     match kind {
         ServerCache::Voxy => "voxy",
         ServerCache::Bobby => "bobby",
@@ -289,12 +289,38 @@ fn prepare_shared_cache(
     if shared.exists() && resolve_real_path(&shared)? == real_source {
         return Ok(shared);
     }
-    // 源缓存若已链接到别处，移动其真实目录会让其他实例的链接失效
+    // 源缓存已链接到别处（例如从通用目录改为共享组）时，移动其真实目录会让其他实例的链接失效，
+    // 因此复制一份到共享目录后改指向，原位置保持不变
     if is_link(source)? {
-        bail!(
-            "源缓存是指向 {} 的链接，无法移动到共享目录，请改用“Junction 指向源实例”",
-            real_source.display()
-        );
+        if shared.exists() {
+            log.info(format!(
+                "{kind}：{} 已存在，沿用其中的缓存",
+                shared.display()
+            ));
+        } else {
+            ensure_cache_not_in_use(real_source)?;
+            fs::create_dir_all(&shared_root)
+                .with_context(|| format!("创建目录 {} 失败", shared_root.display()))?;
+            journal.copy_dir(real_source, &shared)?;
+        }
+        journal.remove_junction(source)?;
+        if let Err(err) = journal.create_junction(source, &shared) {
+            journal
+                .create_junction(source, real_source)
+                .with_context(|| {
+                    format!(
+                        "建立链接失败且无法恢复源实例原来的链接，原缓存位于 {}",
+                        real_source.display()
+                    )
+                })?;
+            return Err(err);
+        }
+        log.success(format!(
+            "{kind}：源缓存原先链接到 {}，已复制到 {} 并改为链接到此处，原位置保持不变",
+            real_source.display(),
+            shared.display()
+        ));
+        return Ok(shared);
     }
     if shared.exists() {
         bail!("共享目录中已存在 {}，为避免覆盖已中止", shared.display());
@@ -522,6 +548,51 @@ mod tests {
 
         let repeated = transfer(target.path())?;
         assert!(repeated.changed_paths.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn voxy_moving_from_common_to_group_copies_and_relinks_source() -> Result<()> {
+        let (_history, mut journal) = test_journal()?;
+        let template = TempDir::new("voxy-regroup-template")?;
+        let target = TempDir::new("voxy-regroup-target")?;
+        let next_target = TempDir::new("voxy-regroup-next")?;
+        let shared = TempDir::new("voxy-regroup-store")?;
+        let source_world = create_voxy_world(template.path(), "example.com", "template")?;
+        let mut transfer = |target_dir: &Path, base: PathBuf| {
+            transfer_server_caches(
+                ServerCache::Voxy,
+                template.path(),
+                target_dir,
+                &CacheTransfer::LinkToShared(base),
+                &mut journal,
+                &mut LogSink::new(&mut |_| {}),
+            )
+        };
+        transfer(target.path(), shared.path().to_path_buf())?;
+
+        let moved = transfer(next_target.path(), shared.path().join("neko"))?;
+
+        assert!(moved.warnings.is_empty(), "{:?}", moved.warnings);
+        let common_world = resolve_real_path(&shared.path().join("voxy/example.com"))?;
+        let group_world = resolve_real_path(&shared.path().join("neko/voxy/example.com"))?;
+        assert_eq!(resolve_real_path(&source_world)?, group_world);
+        assert_eq!(
+            resolve_real_path(&voxy_dir(next_target.path(), "example.com"))?,
+            group_world
+        );
+        assert_eq!(
+            resolve_real_path(&voxy_dir(target.path(), "example.com"))?,
+            common_world
+        );
+        assert_eq!(
+            fs::read_to_string(common_world.join("config.json"))?,
+            "template"
+        );
+        assert_eq!(
+            fs::read_to_string(group_world.join("config.json"))?,
+            "template"
+        );
         Ok(())
     }
 

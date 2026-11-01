@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::fs_ops::{
-    copy_dir_recursive, create_junction, is_link, move_dir, rename_aside, unix_seconds,
+    copy_dir_recursive, create_junction, is_link, move_dir, rename_aside, resolve_real_path,
+    unix_seconds,
 };
 use crate::types::{HistoryEntry, LogSink, MigrationResult};
 
@@ -55,6 +56,11 @@ enum Operation {
     },
     JunctionCreated {
         link: PathBuf,
+    },
+    /// 删除的 Junction 及其原先指向的目录，回退时重建链接。
+    JunctionRemoved {
+        link: PathBuf,
+        destination: PathBuf,
     },
     EmptyDirRemoved {
         path: PathBuf,
@@ -230,6 +236,19 @@ impl Journal {
         create_junction(link, destination)?;
         self.record(Operation::JunctionCreated {
             link: link.to_path_buf(),
+        })
+    }
+
+    /// 只删除 Junction 本身并登记其指向，不影响其指向的目录。
+    pub fn remove_junction(&mut self, link: &Path) -> Result<()> {
+        if !is_link(link)? {
+            bail!("{} 不是链接，无法按链接删除", link.display());
+        }
+        let destination = resolve_real_path(link)?;
+        fs::remove_dir(link).with_context(|| format!("删除链接 {} 失败", link.display()))?;
+        self.record(Operation::JunctionRemoved {
+            link: link.to_path_buf(),
+            destination,
         })
     }
 
@@ -413,6 +432,20 @@ fn undo(
             }
             // 对 Junction 调用 remove_dir 只删除链接本身，不影响其指向的目录
             fs::remove_dir(link).with_context(|| format!("删除链接 {} 失败", link.display()))?;
+            result.changed_paths.push(link.clone());
+        }
+        Operation::JunctionRemoved { link, destination } => {
+            if fs::symlink_metadata(link).is_ok() {
+                let message = format!(
+                    "{} 已存在，无法恢复指向 {} 的链接",
+                    link.display(),
+                    destination.display()
+                );
+                log.warn(message.clone());
+                result.warnings.push(message);
+                return Ok(());
+            }
+            create_junction(link, destination)?;
             result.changed_paths.push(link.clone());
         }
         Operation::EmptyDirRemoved { path } => {

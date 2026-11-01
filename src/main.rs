@@ -8,6 +8,8 @@ mod launcher;
 mod log_file;
 mod map_sync;
 mod pack_sync;
+mod settings;
+mod shared_groups;
 #[cfg(test)]
 mod test_support;
 mod types;
@@ -26,7 +28,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::types::{
     CacheTransfer, ConflictChoice, DetectedInstance, HistoryEntry, LogEntry, LogLevel, LogSink,
     MigrationRequest, MigrationResult, ModDiff, PackConflict, PackTransfer, PackVersion,
-    ServerCache, SharedAsset, SyncMode,
+    ServerCache, ShareItem, SharedAsset, SyncMode,
 };
 
 const CJK_FONT_NAME: &str = "msyh";
@@ -145,13 +147,15 @@ impl PackChoice {
         }
     }
 
-    fn to_transfer(self, shared_dir: &Option<PathBuf>) -> Result<Option<PackTransfer>, String> {
+    /// `content_dir` 为该项内容共享时所在的目录，只有选择共享时才需要它有效。
+    fn to_transfer(
+        self,
+        content_dir: Result<PathBuf, String>,
+    ) -> Result<Option<PackTransfer>, String> {
         Ok(match self {
             PackChoice::Skip => None,
             PackChoice::CopyMissing => Some(PackTransfer::CopyMissing),
-            PackChoice::LinkToShared => Some(PackTransfer::LinkToShared(
-                shared_dir.clone().ok_or("请先选择共享目录")?,
-            )),
+            PackChoice::LinkToShared => Some(PackTransfer::LinkToShared(content_dir?)),
         })
     }
 }
@@ -181,14 +185,16 @@ impl CacheChoice {
         }
     }
 
-    fn to_transfer(self, shared_dir: &Option<PathBuf>) -> Result<Option<CacheTransfer>, String> {
+    /// `content_dir` 为该项内容共享时所在的目录，只有选择共享时才需要它有效。
+    fn to_transfer(
+        self,
+        content_dir: Result<PathBuf, String>,
+    ) -> Result<Option<CacheTransfer>, String> {
         Ok(match self {
             CacheChoice::Skip => None,
             CacheChoice::Copy => Some(CacheTransfer::Copy),
             CacheChoice::LinkToSource => Some(CacheTransfer::LinkToSource),
-            CacheChoice::LinkToShared => Some(CacheTransfer::LinkToShared(
-                shared_dir.clone().ok_or("请先选择共享目录")?,
-            )),
+            CacheChoice::LinkToShared => Some(CacheTransfer::LinkToShared(content_dir?)),
         })
     }
 }
@@ -263,8 +269,15 @@ struct MigratorApp {
     shader_choice: PackChoice,
     blueprint_choice: PackChoice,
     screenshot_choice: PackChoice,
-    /// 用户手动选择的共享目录，为 `None` 时使用目标实例的默认共享目录。
+    /// 用户手动选择或沿用模板已在使用的共享目录，为 `None` 时使用目标实例的默认共享目录。
     shared_dir: Option<PathBuf>,
+    /// 隔离内容所在的共享组名称，由用户填写或沿用模板所在的组。
+    group_name: String,
+    /// 模板的内容链接到多个共享目录或共享组时的提示。
+    link_note: Option<String>,
+    settings: settings::Settings,
+    /// 找不到 APPDATA 时为 `None`，此时设置只在本次运行中生效。
+    settings_path: Option<PathBuf>,
     logs: Vec<LogEntry>,
     /// 创建或写入失败时为 `None`，此后日志只显示在界面上。
     log_file: Option<log_file::LogFile>,
@@ -311,6 +324,10 @@ impl MigratorApp {
             blueprint_choice: PackChoice::Skip,
             screenshot_choice: PackChoice::LinkToShared,
             shared_dir: None,
+            group_name: String::new(),
+            link_note: None,
+            settings: settings::Settings::default(),
+            settings_path: None,
             logs: Vec::new(),
             log_file: None,
             status: RunStatus::Idle,
@@ -365,6 +382,25 @@ impl MigratorApp {
             ),
         }
         app.refresh_history();
+        match settings::settings_path() {
+            Ok(path) => {
+                match settings::load(&path) {
+                    Ok(loaded) => app.settings = loaded,
+                    Err(err) => app.push_log(
+                        LogLevel::Warning,
+                        format!("读取设置失败，使用默认设置：{err:#}"),
+                    ),
+                }
+                app.settings_path = Some(path);
+            }
+            Err(err) => app.push_log(
+                LogLevel::Warning,
+                format!("无法确定设置文件位置，本次的选择不会保存：{err:#}"),
+            ),
+        }
+        let restored_sharing = startup.shared_dir.is_some() || startup.group.is_some();
+        app.shared_dir = startup.shared_dir;
+        app.group_name = startup.group.unwrap_or_default();
         app.selected_dirs = startup.dirs;
         app.rescan_instances();
         let find = |dir: &Option<PathBuf>, instances: &[DetectedInstance]| {
@@ -375,6 +411,9 @@ impl MigratorApp {
         app.target_index = find(&startup.target, &app.instances);
         // 由提权重启恢复的选择已在重启前提示过，不再重复弹窗
         app.checked_selection = (app.template_index, app.target_index);
+        if !restored_sharing {
+            app.detect_template_links();
+        }
         app
     }
 
@@ -423,6 +462,8 @@ impl MigratorApp {
             target: self
                 .selected_instance(self.target_index)
                 .map(|i| i.game_dir.clone()),
+            shared_dir: self.shared_dir.clone(),
+            group: Some(self.group_name.clone()).filter(|group| !group.is_empty()),
         };
         match elevation::restart_as_admin(&startup) {
             Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -550,15 +591,118 @@ impl MigratorApp {
         self.worker.is_some()
     }
 
+    fn is_shared(&self, item: ShareItem) -> bool {
+        match item {
+            ShareItem::Voxy => self.voxy_choice == CacheChoice::LinkToShared,
+            ShareItem::Bobby => self.bobby_choice == CacheChoice::LinkToShared,
+            ShareItem::ResourcePacks => self.pack_choice == PackChoice::LinkToShared,
+            ShareItem::ShaderPacks => self.shader_choice == PackChoice::LinkToShared,
+            ShareItem::AxiomBlueprints => self.blueprint_choice == PackChoice::LinkToShared,
+            ShareItem::Screenshots => self.screenshot_choice == PackChoice::LinkToShared,
+        }
+    }
+
     fn needs_shared_dir(&self) -> bool {
-        [self.voxy_choice, self.bobby_choice].contains(&CacheChoice::LinkToShared)
-            || [
-                self.pack_choice,
-                self.shader_choice,
-                self.blueprint_choice,
-                self.screenshot_choice,
-            ]
-            .contains(&PackChoice::LinkToShared)
+        ShareItem::ALL.into_iter().any(|item| self.is_shared(item))
+    }
+
+    /// 选择共享且设为隔离的内容。
+    fn isolated_items(&self) -> Vec<ShareItem> {
+        ShareItem::ALL
+            .into_iter()
+            .filter(|&item| self.is_shared(item) && !self.settings.is_common(item))
+            .collect()
+    }
+
+    /// 该项内容共享时所在的目录：通用为共享目录本身，隔离为其下的共享组目录。
+    fn content_dir(&self, item: ShareItem) -> Result<PathBuf, String> {
+        let root = self.effective_shared_dir().ok_or("请先选择共享目录")?;
+        if self.settings.is_common(item) {
+            return Ok(root);
+        }
+        shared_groups::validate_group_name(&self.group_name)?;
+        Ok(root.join(&self.group_name))
+    }
+
+    fn set_item_common(&mut self, item: ShareItem, common: bool) {
+        self.settings.set_common(item, common);
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        if let Err(err) = settings::save(&path, &self.settings) {
+            self.push_log(LogLevel::Warning, format!("保存设置失败：{err:#}"));
+        }
+    }
+
+    /// 模板已链接到某个共享目录或共享组时沿用它，避免同一批实例分散到多个共享目录。
+    fn detect_template_links(&mut self) {
+        self.link_note = None;
+        let Some(template) = self.selected_instance(self.template_index) else {
+            return;
+        };
+        let game_dir = template.game_dir.clone();
+        let mut candidates: Vec<PathBuf> = self.effective_shared_dir().into_iter().collect();
+        for instance in &self.instances {
+            let root = instance.minecraft_root.join(DEFAULT_SHARED_DIR_NAME);
+            if !candidates.contains(&root) {
+                candidates.push(root);
+            }
+        }
+        let found = match shared_groups::detect_linked_locations(&game_dir, &candidates) {
+            Ok(found) => found,
+            Err(err) => {
+                self.push_log(
+                    LogLevel::Warning,
+                    format!("检查模板实例的链接失败：{err:#}"),
+                );
+                return;
+            }
+        };
+        let mut roots: Vec<PathBuf> = found.iter().map(|l| l.shared_root.clone()).collect();
+        roots.sort();
+        roots.dedup();
+        let mut groups: Vec<String> = found.iter().filter_map(|l| l.group.clone()).collect();
+        groups.sort();
+        groups.dedup();
+        if roots.len() > 1 || groups.len() > 1 {
+            let detail: Vec<String> = found
+                .iter()
+                .map(|location| {
+                    let place = match &location.group {
+                        Some(group) => format!("共享组 {group}"),
+                        None => "通用目录".to_string(),
+                    };
+                    format!(
+                        "{} → {} 下的{place}",
+                        location.item,
+                        location.shared_root.display()
+                    )
+                })
+                .collect();
+            let note = format!(
+                "模板的内容链接到了多个位置，请手动确认共享目录与共享组：{}",
+                detail.join("；")
+            );
+            self.push_log(LogLevel::Warning, note.clone());
+            self.link_note = Some(note);
+            return;
+        }
+        if let Some(root) = roots.pop()
+            && Some(&root) != self.effective_shared_dir().as_ref()
+        {
+            self.push_log(
+                LogLevel::Info,
+                format!("沿用模板实例已在使用的共享目录：{}", root.display()),
+            );
+            self.shared_dir = (Some(&root) != self.default_shared_dir().as_ref()).then_some(root);
+            self.refresh_log_redactions();
+        }
+        if let Some(group) = groups.pop()
+            && group != self.group_name
+        {
+            self.push_log(LogLevel::Info, format!("沿用模板实例所在的共享组：{group}"));
+            self.group_name = group;
+        }
     }
 
     fn default_shared_dir(&self) -> Option<PathBuf> {
@@ -583,13 +727,21 @@ impl MigratorApp {
         if template.game_dir == target.game_dir {
             return Err("模板实例与目标实例不能相同".to_string());
         }
-        let shared_dir = self.effective_shared_dir();
-        let voxy = self.voxy_choice.to_transfer(&shared_dir)?;
-        let bobby = self.bobby_choice.to_transfer(&shared_dir)?;
-        let resource_packs = self.pack_choice.to_transfer(&shared_dir)?;
-        let shader_packs = self.shader_choice.to_transfer(&shared_dir)?;
-        let axiom_blueprints = self.blueprint_choice.to_transfer(&shared_dir)?;
-        let screenshots = self.screenshot_choice.to_transfer(&shared_dir)?;
+        let dir = |item| self.content_dir(item);
+        let voxy = self.voxy_choice.to_transfer(dir(ShareItem::Voxy))?;
+        let bobby = self.bobby_choice.to_transfer(dir(ShareItem::Bobby))?;
+        let resource_packs = self
+            .pack_choice
+            .to_transfer(dir(ShareItem::ResourcePacks))?;
+        let shader_packs = self
+            .shader_choice
+            .to_transfer(dir(ShareItem::ShaderPacks))?;
+        let axiom_blueprints = self
+            .blueprint_choice
+            .to_transfer(dir(ShareItem::AxiomBlueprints))?;
+        let screenshots = self
+            .screenshot_choice
+            .to_transfer(dir(ShareItem::Screenshots))?;
         if !self.sync_options
             && !self.sync_mod_configs
             && !self.sync_maps
@@ -775,6 +927,7 @@ impl MigratorApp {
         self.bobby_choice = preset.cache_choice;
         self.blueprint_choice = PackChoice::Skip;
         self.screenshot_choice = PackChoice::LinkToShared;
+        self.set_item_common(ShareItem::Screenshots, true);
         self.push_log(LogLevel::Info, format!("已应用固定配置：{}", preset.name));
     }
 
@@ -841,6 +994,7 @@ impl MigratorApp {
         let selection = (self.template_index, self.target_index);
         if selection != self.checked_selection && self.target_index.is_some() {
             self.checked_selection = selection;
+            self.detect_template_links();
             self.check_write_access();
         }
 
@@ -871,28 +1025,54 @@ impl MigratorApp {
             );
         });
 
+        let mut toggled = Vec::new();
         section(ui, "地图与缓存", |ui| {
             ui.checkbox(&mut self.sync_maps, "地图与路点（Xaero）");
-            for (kind, choice) in [
-                (ServerCache::Voxy, &mut self.voxy_choice),
-                (ServerCache::Bobby, &mut self.bobby_choice),
+            for (item, kind, choice) in [
+                (ShareItem::Voxy, ServerCache::Voxy, &mut self.voxy_choice),
+                (ShareItem::Bobby, ServerCache::Bobby, &mut self.bobby_choice),
             ] {
                 field_label(ui, &format!("{kind} 缓存"));
                 show_cache_combo(ui, kind, choice);
+                if *choice == CacheChoice::LinkToShared {
+                    show_common_toggle(ui, item, self.settings.is_common(item), &mut toggled);
+                }
             }
         });
 
         section(ui, "材质包、光影、蓝图与截图", |ui| {
-            for (kind, choice) in [
-                (SharedAsset::ResourcePacks, &mut self.pack_choice),
-                (SharedAsset::ShaderPacks, &mut self.shader_choice),
-                (SharedAsset::AxiomBlueprints, &mut self.blueprint_choice),
-                (SharedAsset::Screenshots, &mut self.screenshot_choice),
+            for (item, kind, choice) in [
+                (
+                    ShareItem::ResourcePacks,
+                    SharedAsset::ResourcePacks,
+                    &mut self.pack_choice,
+                ),
+                (
+                    ShareItem::ShaderPacks,
+                    SharedAsset::ShaderPacks,
+                    &mut self.shader_choice,
+                ),
+                (
+                    ShareItem::AxiomBlueprints,
+                    SharedAsset::AxiomBlueprints,
+                    &mut self.blueprint_choice,
+                ),
+                (
+                    ShareItem::Screenshots,
+                    SharedAsset::Screenshots,
+                    &mut self.screenshot_choice,
+                ),
             ] {
                 field_label(ui, &kind.to_string());
                 show_pack_combo(ui, kind, choice);
+                if *choice == PackChoice::LinkToShared {
+                    show_common_toggle(ui, item, self.settings.is_common(item), &mut toggled);
+                }
             }
         });
+        for (item, common) in toggled {
+            self.set_item_common(item, common);
+        }
 
         if self.needs_shared_dir() {
             section(ui, "共享目录", |ui| {
@@ -921,9 +1101,66 @@ impl MigratorApp {
                         self.shared_dir = None;
                     }
                 });
+                self.show_group_picker(ui);
+                if let Some(note) = &self.link_note {
+                    ui.label(RichText::new(note).color(ui.visuals().warn_fg_color));
+                }
             });
         }
         self.show_history_section(ui);
+    }
+
+    /// 有隔离内容时选择或填写共享组。
+    fn show_group_picker(&mut self, ui: &mut egui::Ui) {
+        let isolated = self.isolated_items();
+        if isolated.is_empty() {
+            return;
+        }
+        let root = self.effective_shared_dir();
+        field_label(ui, "共享组（隔离的内容放在这里）");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.group_name)
+                    .hint_text("例如 neko")
+                    .desired_width(160.0),
+            );
+            egui::ComboBox::from_id_salt("group_combo")
+                .selected_text("已有组")
+                .show_ui(ui, |ui| {
+                    match root.as_deref().map(shared_groups::list_groups) {
+                        Some(Ok(groups)) if !groups.is_empty() => {
+                            for group in groups {
+                                let selected = self.group_name == group;
+                                if ui.selectable_label(selected, &group).clicked() {
+                                    self.group_name = group;
+                                }
+                            }
+                        }
+                        Some(Err(err)) => {
+                            ui.label(format!("读取失败：{err:#}"));
+                        }
+                        _ => {
+                            ui.label("暂无");
+                        }
+                    }
+                });
+        });
+        match shared_groups::validate_group_name(&self.group_name) {
+            Err(reason) => {
+                ui.label(RichText::new(reason).color(ui.visuals().warn_fg_color));
+            }
+            Ok(()) => {
+                let names: Vec<String> = isolated.iter().map(ToString::to_string).collect();
+                let place = root
+                    .map(|root| root.join(&self.group_name).display().to_string())
+                    .unwrap_or_default();
+                ui.label(
+                    RichText::new(format!("{} 位于 {place}", names.join("、")))
+                        .weak()
+                        .small(),
+                );
+            }
+        }
     }
 
     fn show_action_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1468,6 +1705,28 @@ fn show_cache_combo(ui: &mut egui::Ui, kind: ServerCache, choice: &mut CacheChoi
                 ui.selectable_value(choice, option, option.label());
             }
         });
+}
+
+/// 共享方式下的"通用"开关，改动记入 `toggled` 由调用方保存。
+fn show_common_toggle(
+    ui: &mut egui::Ui,
+    item: ShareItem,
+    common: bool,
+    toggled: &mut Vec<(ShareItem, bool)>,
+) {
+    let mut value = common;
+    let hint = if common {
+        "放在共享目录根下，所有实例共用"
+    } else {
+        "放在共享组下，只与同组的实例共用"
+    };
+    if ui
+        .checkbox(&mut value, "通用（不放入共享组）")
+        .on_hover_text(hint)
+        .changed()
+    {
+        toggled.push((item, value));
+    }
 }
 
 fn show_pack_combo(ui: &mut egui::Ui, kind: SharedAsset, choice: &mut PackChoice) {
