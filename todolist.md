@@ -17,7 +17,6 @@
 
 - 已核实：
   - PCL 每个安装目录下的 `PCL\Setup.ini` 记录 `LaunchFolderSelect:$.minecraft\`，`$` 表示相对 PCL 程序所在目录。这个目录已被"程序工作目录及其父级的 `.minecraft`"扫描源覆盖（程序与 PCL 放在一起时）。
-  - 注册表 `HKCU\Software\PCL` 的 `LaunchFolders` 由同一用户的所有 PCL 安装共用，开发机上该项为空，两个 PCL 安装都没有使用它。
 - 待办：在 PCL 中手动添加一个游戏文件夹后核实 `LaunchFolders` 的取值格式，再决定是否读取注册表（读取注册表需调用 `reg query`，不引入新依赖）。
 
 ## 1.13 前后按键格式转换
